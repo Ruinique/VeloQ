@@ -31,6 +31,7 @@ __pycache__/
 !/scripts/install.sh
 !/scripts/bump-version.sh
 !/scripts/check-agent-plugin-package.sh
+!/scripts/bench-daemon.py
 
 # Local-only Claude handoff snapshots
 .claude/handoffs/
@@ -39,6 +40,7 @@ __pycache__/
 
 # Local/private scratch artifacts
 .omc/
+.tmp/
 
 # CI / pre-commit local state (cache + downloads); keep tracked configs
 /.cargo/*

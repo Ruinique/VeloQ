@@ -55,20 +55,20 @@ version).
 
    | Verb                        | Row key format                                                                                                                                                                                                |
    | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-   | `stats`                     | `kind\|<name?>\|dev:<n?>\|stream:<n?>\|ctx:<n?>\|graph:<n?>\|graph_node:<n?>\|style:<push_pop\|start_end\|unknown?>\|nvtx:<rowid-or-none?>\|nvtx-path:<path-or-none?>\|grid:<x>x<y>x<z>?\|block:<x>x<y>x<z>?` |
+   | `stats`                     | `kind\|<name?>\|pid:<n?>\|dev:<n?>\|stream:<n?>\|ctx:<n?>\|graph:<n?>\|graph_node:<n?>\|style:<push_pop\|start_end\|unknown?>\|nvtx:<rowid-or-none?>\|nvtx-path:<path-or-none?>\|grid:<x>x<y>x<z>?\|block:<x>x<y>x<z>?` |
    | `search`                    | `<row_id>` (e.g. `kernel:1234`)                                                                                                                                                                               |
    | `inspect`                   | `<row_id>` (matches the requested row_id; `NotFound` same)                                                                                                                                                    |
    | `timeline`                  | `bucket\|<start_ns>..<end_ns>`                                                                                                                                                                                |
    | `viz timeline`              | `figure\|timeline\|<start_ns>..<end_ns>\|req:<fingerprint>`                                                                                                                                                   |
-   | `concurrency`               | `concurrency\|dev:<n>` (per device; nested `streams[]` carry `stream_id`, no key)                                                                                                                             |
-   | `slices` instance           | `slice\|<name>\|@<cpu_start_ns>`                                                                                                                                                                              |
-   | `slices` aggregate          | `scope\|<name>` / `scope\|path:<path>` per `--group-by`                                                                                                                                                       |
-   | `gaps` device               | `gap\|dev:<n>\|@<start_ns>` (default; cross-stream sweep)                                                                                                                                                     |
-   | `gaps` stream               | `gap\|dev:<n>\|stream:<n>\|@<start_ns>` (`--scope stream`)                                                                                                                                                    |
+   | `concurrency`               | `concurrency\|pid:<n>\|dev:<n>` (per process/device; nested `streams[]` carry `stream_id`, no key)                                                                                                            |
+   | `slices` instance           | `slice\|pid:<n>\|<name>\|@<cpu_start_ns>`                                                                                                                                                                     |
+   | `slices` aggregate          | `scope\|pid:<n>\|<name>` / `scope\|pid:<n>\|path:<path>` per `--group-by`                                                                                                                                     |
+   | `gaps` device               | `gap\|pid:<n>\|dev:<n>\|@<start_ns>` (default; cross-stream sweep)                                                                                                                                            |
+   | `gaps` stream               | `gap\|pid:<n>\|dev:<n>\|stream:<n>\|@<start_ns>` (`--scope stream`)                                                                                                                                           |
    | `gaps` trace                | `gap\|@<start_ns>` (`--scope trace`; multi-GPU)                                                                                                                                                               |
-   | ↳ aux.streams               | `stream\|dev:<n>\|stream:<n>` (scope-independent summary)                                                                                                                                                     |
+   | ↳ aux.streams               | `stream\|pid:<n>\|dev:<n>\|stream:<n>` (scope-independent summary)                                                                                                                                            |
    | `correlate`                 | `<seed_row_id>` per result; embedded events use `<row_id>`                                                                                                                                                    |
-   | `graph-replays`             | `graph-replay\|<synthetic_id>` where `synthetic_id` is packed `(device, context, correlationId)`                                                                                                              |
+   | `graph-replays`             | `graph-replay\|<synthetic_id>` where `synthetic_id` renders `(process, device, context, correlationId)`                                                                                                       |
    | `hardware`                  | `host\|<hostname>`                                                                                                                                                                                            |
    | `summary`                   | `table\|<table_name>`                                                                                                                                                                                         |
    | `metrics` gpu               | `counter\|type:<type_id>\|metric:<metric_id>`                                                                                                                                                                 |
@@ -77,6 +77,10 @@ version).
    | `metrics` cpu-sched         | `tid:<id>` / `cpu:<id>` / `state:<name>` per `--group-by`                                                                                                                                                     |
    | `prep`                      | `sidecar\|<sidecar-id>`                                                                                                                                                                                       |
    | `agent`                     | `agent\|<agent-id>`                                                                                                                                                                                           |
+   | `bank explain`              | single explain payload (not a `rows[]` list)                                                                                                                                                                  |
+   | `bank trace`                | `lane:<lane>`                                                                                                                                                                                                 |
+   | `bank compare`              | `swizzle:<B>,<M>,<S>`                                                                                                                                                                                         |
+   | `bank search`               | `swizzle:<B>,<M>,<S>`                                                                                                                                                                                         |
    | `ncu summary`               | `totals` (single-row summary)                                                                                                                                                                                 |
    | `ncu launches`              | `launch:<idx>`                                                                                                                                                                                                |
    | `ncu inspect`               | `launch:<idx>`                                                                                                                                                                                                |
@@ -118,14 +122,17 @@ version).
 
 3. **Per-source version (`SourceRef.version`)**: bumps independently
    from `ENVELOPE_VERSION` on any breaking shape change to that
-   source's payloads. Today NSys is `v3`: `v1` introduced the NVTX
+   source's payloads. Today NSys is `v4`: `v1` introduced the NVTX
    domain dimension on `stats --group-by nvtx-path` rows
    (domain-qualified key plus resolved
    `domain_id`/`domain_pid`/`domain_name`), and `v2` changes
    `prep` / `prep --status` to the canonical sidecar-readiness list
    response (`data.rows[]` with `sidecar|<sidecar-id>` keys,
    plus command-level context under `data.auxiliary`); `v3` removes
-   the `viz timeline` label character-cap option and response echo.
+   the `viz timeline` label character-cap option and response echo;
+   `v4` makes process identity part of CUDA-local row fields, keys,
+   filters, aggregations, graph correlation, and trace-map device
+   introspection.
    NCU is `v1` — the
    `ncu_report`-native wire (`inspect` drops the
    section catalog and cpu/python stacks, `summary.auxiliary.session`
@@ -169,10 +176,15 @@ version).
 6. **Type conversion at the boundary.** Read DuckDB columns as
    their native Arrow type (`Int64Array`) and convert once. Never
    force `UBIGINT`.
-7. **One subcommand = one DuckDB connection = one process.** CLI
-   calls stay stateless — no background threads, no channel-based
-   handles. The Parquet + metadata sidecars on disk make repeat
-   calls fast enough.
+7. **One-shot execution stays independently stateless.** With daemon
+   routing disabled, one CLI subcommand executes in its own process
+   and owns one query connection; it does not require a background
+   service or channel-based handle. Source implementations execute
+   through `veloq_core::ProfileSource::execute` and return a buffered
+   `SourceExecution`; the one-shot dispatcher projects those bytes to
+   process stdout/stderr. The optional, manually enabled local daemon
+   may reuse sessions and validated sidecars through the same boundary,
+   but it must not replace or weaken the one-shot contract.
 
 ## Workspace layout
 
@@ -180,6 +192,7 @@ version).
 veloq/
 └── crates/
     ├── veloq-core/             # Envelope, SourceRef, ProfileSource trait,
+    │                             buffered SourceExecution boundary,
     │                             OutputFormat, sort + time helpers
     ├── veloq-data/             # Source-neutral file/parquet cache helpers
     ├── veloq-query/            # DuckDB-backed query helpers shared by
@@ -198,7 +211,8 @@ veloq/
     │   └── veloq-nsys/         # Nsys clap surface + dispatch + CSV/table
     │                             views; impls `NsysSource: ProfileSource`
     ├── ncu/
-    │   └── veloq-ncu/          # `.ncu-rep` via NVIDIA's `ncu_report`
+    │   └── veloq-ncu/          # `.ncu-rep` / `.ncu-repz` via NVIDIA's
+    │                             `ncu_report`
     │                             API → native sidecar + SASS/PTX
     │                             correlation; impls `NcuSource: ProfileSource`
     └── pytorch/
@@ -304,7 +318,7 @@ Not shipped yet:
       reuses this directly as its parquet cache; no separate
       `veloq-parquet/`.
     - `<trace>.veloq/correlation.bin` — `CorrelationIndex`;
-      `(device, context, correlationId)` index
+      `(process, device, context, correlationId)` index
     - `<trace>.veloq/meta.bin` — `TraceMetaCache`; schema version,
       capabilities, hardware, per-table counts, NVTX nesting
       (`HashMap<i64, NvtxEntry { depth, iter_index }>`). Built
@@ -325,7 +339,8 @@ Not shipped yet:
     - `<report>.veloq/ncu-native.json.gz` — `native::cache::build_or_load`;
       gzipped JSON sidecar from the `ncu_report` ingest. The sole NCU
       ingest path, reused by every NCU verb. Freshness is keyed on a
-      sha256 content-hash of the `.ncu-rep` (checkout-stable).
+      sha256 content-hash of the input `.ncu-rep` or `.ncu-repz`
+      (checkout-stable).
     - `<report>.veloq/disasm/<sha>.correlated.json` — per-cubin
       SASS/PTX/source-line index from nvdisasm + cuobjdump.
   - PyTorch:
@@ -346,6 +361,12 @@ Not shipped yet:
   shows up, add a new adapter rather than reintroducing a generic
   fallback.
 
+- **PyTorch input routing**: automatic source detection claims only
+  `.pt.trace.json` and `.pt.trace.json.gz`. Explicit `veloq pytorch`
+  trace-bearing commands accept Chrome trace `.json` and `.json.gz`
+  filenames. Keep these predicates separate so generic JSON is never
+  claimed automatically.
+
 - **Domain knowledge** (load-bearing for SQL implementers):
   - `globalTid` bit layout:
     `[bits 48-63: HW/Host ID] [bits 24-47: PID (24b)] [bits 16-23: Source Domain ID (8b)] [bits 0-15: TID (16b)]`.
@@ -358,14 +379,15 @@ Not shipped yet:
     constant offset to the wrong-extracted "pid"). Use
     `veloq_nsys_query::decode_global_tid`.
   - `NVTX_EVENTS` is optional — always probe first.
-  - `correlationId` is **not** globally unique: it resets per
-    `(device, context)`. SQL that walks runtime → kernel/memcpy/
+  - CUDA `deviceId`, `contextId`, `streamId`, and `correlationId` are
+    process-local. SQL that walks runtime → kernel/memcpy/
     memset must bridge through `TARGET_INFO_CUDA_CONTEXT_INFO`
-    (`device, context → process_id`) and match the runtime's
+    (`process, device, context`) and match the runtime's
     native_pid (high bits of `globalTid`). See
     `nvtx_attribution.rs` (forward) and `nvtx_reverse.rs`
     (reverse) for the canonical CTEs.
-  - Synthetic Correlation ID: `device(8b) | context(16b) | raw_corr(40b)`.
+  - Synthetic correlation identity is the lossless struct
+    `(process, device, context, raw_corr)` and renders all four axes.
 
 ## Authoring a new `ProfileSource`
 

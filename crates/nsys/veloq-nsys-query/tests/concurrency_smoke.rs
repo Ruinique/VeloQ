@@ -6,7 +6,8 @@ mod fixture;
 
 use anyhow::{Result, anyhow};
 use veloq_core::time::TimeWindow;
-use veloq_nsys_query::concurrency::{ConcurrencyRequest, run};
+use veloq_nsys_data::Trace;
+use veloq_nsys_query::concurrency::{ConcurrencyRequest, run, run_with_trace};
 
 #[test]
 fn device_stream_and_compute_copy_overlap_match_rfc_example() -> Result<()> {
@@ -20,7 +21,7 @@ fn device_stream_and_compute_copy_overlap_match_rfc_example() -> Result<()> {
         .first()
         .ok_or_else(|| anyhow!("expected one device row"))?;
 
-    assert_eq!(d.key, "concurrency|dev:0");
+    assert_eq!(d.key, "concurrency|pid:12345|dev:0");
     assert_eq!(d.device_id, 0);
     assert_eq!(d.sum_busy_ns, 210_000_000);
     assert_eq!(d.union_busy_ns, 120_000_000);
@@ -127,5 +128,19 @@ fn window_clips_the_measured_overlap() -> Result<()> {
     );
     // overlap_ns identity must still hold within the window.
     assert_eq!(d.overlap_ns, d.sum_busy_ns - d.union_busy_ns);
+    Ok(())
+}
+
+#[test]
+fn worker_budget_does_not_change_response() -> Result<()> {
+    let fixture = fixture::concurrency_overlap()?;
+    let serial = Trace::open_for_daemon(fixture.path(), 1, None)?;
+    let parallel = Trace::open_for_daemon(fixture.path(), 4, None)?;
+    let request = ConcurrencyRequest::default();
+
+    assert_eq!(
+        serde_json::to_value(run_with_trace(&serial, request.clone())?)?,
+        serde_json::to_value(run_with_trace(&parallel, request)?)?
+    );
     Ok(())
 }

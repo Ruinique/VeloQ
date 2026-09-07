@@ -24,8 +24,8 @@ pub(crate) struct StatsEventScan {
     pub(crate) context_expr: &'static str,
     pub(crate) stream_expr: &'static str,
     pub(crate) bytes_expr: &'static str,
-    pub(crate) graph_id_expr: &'static str,
-    pub(crate) graph_node_id_expr: &'static str,
+    pub(crate) graph_id_expr: String,
+    pub(crate) graph_node_id_expr: String,
     pub(crate) event_type_expr: &'static str,
     pub(crate) where_clause: String,
     pub(crate) params: Vec<Value>,
@@ -54,6 +54,7 @@ pub(crate) enum NvtxFilterPolicy<'a> {
 /// This intentionally avoids rich headline columns. Callers materialize
 /// those later after `LIMIT` has selected survivor rowids.
 pub(crate) fn search_rank_select(
+    trace: &veloq_nsys_data::Trace,
     kind: EventKind,
     nvtx_scope: crate::nvtx_attribution::NvtxScope,
     include_name: bool,
@@ -64,6 +65,13 @@ pub(crate) fn search_rank_select(
     }
 
     let sem = EventSemantics::new(kind);
+    let start_col = if matches!(kind, EventKind::CudaEvent) {
+        "t.timestamp"
+    } else {
+        "t.start"
+    };
+    let process =
+        veloq_nsys_data::process_sql_projection(trace, sem.table(), "t", "event_proc", start_col);
     let (start_expr, duration_expr) = start_duration_exprs(kind);
     let (name_projection, name_joins) = name_projection(sem, include_name);
     let mut filters = SqlFilter::default();
@@ -88,12 +96,15 @@ pub(crate) fn search_rank_select(
             t.rowid AS row_id_num,
             {start_expr} AS start_ns,
             {duration_expr} AS duration_ns,
+            {process_expr} AS process_id,
             {device_expr} AS device_id,
             {stream_expr} AS stream_id{name_projection}
-        FROM nsight.{table} t {name_joins}
+        FROM nsight.{table} t {name_joins} {process_join}
         {where_clause}
         "#,
         label = sem.label(),
+        process_expr = process.expr,
+        process_join = process.join,
         device_expr = sem.device_expr(),
         stream_expr = sem.stream_expr(),
         table = sem.table(),
@@ -103,6 +114,10 @@ pub(crate) fn search_rank_select(
 
 /// Build the common scan semantics for one `stats` event table.
 ///
+/// `columns` is the probed schema map; schema-optional columns
+/// (`graphId` / `graphNodeId` on kernel/memcpy/memset) project NULL
+/// when the trace omits them.
+///
 /// When a time window is present the returned params are ordered as:
 /// clipped-duration `end,start`, then overlap-filter `end,start`.
 pub(crate) fn stats_event_scan(
@@ -110,6 +125,7 @@ pub(crate) fn stats_event_scan(
     abs_window: Option<(i64, i64)>,
     nvtx_scope: crate::nvtx_attribution::NvtxScope,
     collapse_versioned: bool,
+    columns: &crate::column_map::ColumnMap,
 ) -> NsysQueryResult<StatsEventScan> {
     ensure_stats_scan_kind(kind)?;
     let sem = EventSemantics::new(kind);
@@ -135,8 +151,8 @@ pub(crate) fn stats_event_scan(
         context_expr: sem.context_expr(),
         stream_expr: sem.stream_expr(),
         bytes_expr: sem.stats_bytes_expr(),
-        graph_id_expr: sem.graph_id_expr(),
-        graph_node_id_expr: sem.graph_node_id_expr(),
+        graph_id_expr: sem.graph_id_expr(columns),
+        graph_node_id_expr: sem.graph_node_id_expr(columns),
         event_type_expr: sem.event_type_expr(),
         where_clause,
         params,
@@ -307,6 +323,41 @@ fn name_match_prefilter(kind: EventKind) -> Option<&'static str> {
 mod tests {
     use super::*;
     use anyhow::Result;
+    use duckdb::Connection;
+    use tempfile::TempDir;
+    use veloq_nsys_data::Trace;
+
+    fn minimal_trace() -> Result<(TempDir, Trace)> {
+        let dir = tempfile::tempdir()?;
+        let pqtdir = dir.path().join("test_pqtdir");
+        std::fs::create_dir_all(&pqtdir)?;
+        let conn = Connection::open_in_memory()?;
+        let tables = [
+            (
+                "CUPTI_ACTIVITY_KIND_KERNEL",
+                r#"CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (start BIGINT, "end" BIGINT)"#,
+            ),
+            (
+                "CUPTI_ACTIVITY_KIND_CUDA_EVENT",
+                "CREATE TABLE CUPTI_ACTIVITY_KIND_CUDA_EVENT (timestamp BIGINT)",
+            ),
+            (
+                "NVTX_EVENTS",
+                r#"CREATE TABLE NVTX_EVENTS (start BIGINT, "end" BIGINT)"#,
+            ),
+        ];
+        for (table, ddl) in tables {
+            conn.execute_batch(ddl)?;
+            let out = pqtdir.join(format!("{table}.parquet"));
+            let out_lit = out.to_string_lossy().replace('\'', "''");
+            conn.execute(
+                &format!(r#"COPY (SELECT * FROM "{table}") TO '{out_lit}' (FORMAT PARQUET)"#),
+                [],
+            )?;
+        }
+        let trace = Trace::open(&pqtdir)?;
+        Ok((dir, trace))
+    }
 
     #[test]
     fn scan_filter_orders_window_location_and_nvtx_predicates() -> Result<()> {
@@ -418,6 +469,7 @@ mod tests {
             Some((10, 20)),
             crate::nvtx_attribution::NvtxScope::None,
             false,
+            &crate::column_map::ColumnMap::new(),
         )?;
         assert_eq!(
             scan.duration_expr,
@@ -444,6 +496,7 @@ mod tests {
             None,
             crate::nvtx_attribution::NvtxScope::None,
             true,
+            &crate::column_map::ColumnMap::new(),
         )?;
         assert!(scan.display_expr.starts_with("regexp_replace("));
         assert!(scan.short_expr.starts_with("regexp_replace("));
@@ -463,6 +516,7 @@ mod tests {
             None,
             crate::nvtx_attribution::NvtxScope::None,
             false,
+            &crate::column_map::ColumnMap::new(),
         )?;
         assert_eq!(nvtx.where_clause, r#"WHERE t."end" IS NOT NULL"#);
 
@@ -471,6 +525,7 @@ mod tests {
             None,
             crate::nvtx_attribution::NvtxScope::Attributed,
             false,
+            &crate::column_map::ColumnMap::new(),
         )?;
         assert_eq!(graph.where_clause, "WHERE FALSE");
         assert!(graph.params.is_empty());
@@ -479,7 +534,9 @@ mod tests {
 
     #[test]
     fn rank_select_uses_cuda_event_timestamp_and_zero_duration() -> Result<()> {
+        let (_dir, trace) = minimal_trace()?;
         let fragment = search_rank_select(
+            &trace,
             EventKind::CudaEvent,
             crate::nvtx_attribution::NvtxScope::None,
             false,
@@ -494,7 +551,9 @@ mod tests {
 
     #[test]
     fn rank_select_adds_nvtx_intrinsic_filter_and_search_name() -> Result<()> {
+        let (_dir, trace) = minimal_trace()?;
         let fragment = search_rank_select(
+            &trace,
             EventKind::Nvtx,
             crate::nvtx_attribution::NvtxScope::None,
             true,
@@ -512,7 +571,9 @@ mod tests {
 
     #[test]
     fn rank_select_adds_attribution_and_prefilter() -> Result<()> {
+        let (_dir, trace) = minimal_trace()?;
         let fragment = search_rank_select(
+            &trace,
             EventKind::Kernel,
             crate::nvtx_attribution::NvtxScope::Attributed,
             true,

@@ -1,21 +1,22 @@
 //! `veloq concurrency <trace>` — GPU kernel/transfer overlap extraction.
 //!
 //! Overlap is the union-versus-sum of GPU event
-//! intervals: per device (and per stream) we report `sum_busy_ns`, the
+//! intervals: per process-local device (and per stream) we report `sum_busy_ns`, the
 //! interval-`union_busy_ns`, their difference `overlap_ns`, and the peak
 //! `max_concurrency`, plus a compute-versus-copy block. The union and
 //! the concurrency degree are the parts an agent cannot reconstruct in
 //! jq from per-event rows — exposing them is the point of the verb.
 //!
-//! The interval sweep ([`measures`]) generalizes
-//! [`crate::graph_replays`]'s `busy_ns`: it makes no same-stream-serial
-//! assumption, so same-stream Programmatic Dependent Launch (PDL)
-//! overlap is counted, not dropped. Compute/copy overlap falls out of
+//! The interval sweep makes no same-stream-serial assumption,
+//! so same-stream Programmatic Dependent Launch (PDL) overlap is
+//! counted, not dropped. Compute/copy overlap falls out of
 //! inclusion-exclusion: `compute_union + copy_union − device_union`.
 
 use duckdb::types::Value;
+use rayon::prelude::*;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::path::Path;
 use veloq_core::time::TimeWindow;
 use veloq_nsys_data::Trace;
@@ -27,19 +28,22 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct ConcurrencyRequest {
+    /// Optional native process filter.
+    pub process_id: Option<i64>,
     /// Optional `device_id` filter (NSys `deviceId`). Overlap is always
-    /// per device; this just restricts which device rows are emitted.
+    /// per process/device; this restricts which rows are emitted.
     pub device: Option<i32>,
     /// Optional window — measures overlap over each event's clipped
     /// portion (overlap-inclusion, like the other windowed verbs).
     pub time_window: Option<TimeWindow>,
-    /// Max device rows to return.
+    /// Max process/device rows to return.
     pub limit: usize,
 }
 
 impl Default for ConcurrencyRequest {
     fn default() -> Self {
         Self {
+            process_id: None,
             device: None,
             time_window: None,
             limit: 100,
@@ -49,23 +53,25 @@ impl Default for ConcurrencyRequest {
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ConcurrencyResponse {
-    /// Device rows returned (after LIMIT).
+    /// Process/device rows returned (after LIMIT).
     pub count: usize,
-    /// Devices with at least one in-scope event, before LIMIT.
+    /// Process/device scopes with at least one in-scope event, before LIMIT.
     pub total_matched: i64,
     /// Resolved `--from`/`--to` window, if any (absolute ns).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_window_ns: Option<(i64, i64)>,
-    /// Canonical primary list — one row per device, ascending `device_id`.
+    /// Canonical primary list — one row per process/device, ascending
+    /// `(process_id, device_id)`.
     pub rows: Vec<DeviceConcurrency>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct DeviceConcurrency {
-    /// Cross-trace key. `concurrency|dev:<device_id>`.
+    /// Cross-trace key. `concurrency|pid:<pid>|dev:<device_id>`.
     pub key: String,
+    pub process_id: i64,
     pub device_id: i32,
-    /// Sum of in-scope event durations on this device.
+    /// Sum of in-scope event durations on this process-local device.
     pub sum_busy_ns: i64,
     /// Wall time during which at least one in-scope event ran.
     pub union_busy_ns: i64,
@@ -101,75 +107,6 @@ pub struct StreamConcurrency {
     pub max_concurrency: i64,
 }
 
-/// Sum, union, and peak-concurrency over a set of half-open intervals.
-/// Intervals that exactly touch (`a.end == b.start`) merge for `union`
-/// and do not count as simultaneously open, so back-to-back serial
-/// events yield `overlap = 0` and do not inflate `max_concurrency`.
-///
-/// All three measures fall out of a single endpoint sweep: `sum` is a
-/// scan, `union` and `peak` share one sort of the 2N start/end points.
-/// At an equal timestamp the ending edge (`-1`) sorts before the
-/// starting edge (`+1`), so back-to-back intervals neither inflate the
-/// peak nor open a spurious gap in the union — the closing region and
-/// the reopening region meet at the shared boundary and sum to the same
-/// covered span as a merge would.
-fn measures(intervals: &[(i64, i64)]) -> (i64, i64, i64) {
-    let sum: i64 = intervals.iter().map(|(s, e)| e - s).sum();
-
-    let mut points: Vec<(i64, i8)> = Vec::with_capacity(intervals.len() * 2);
-    for (s, e) in intervals {
-        points.push((*s, 1));
-        points.push((*e, -1));
-    }
-    points.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-
-    let mut open = 0i64;
-    let mut peak = 0i64;
-    let mut union = 0i64;
-    let mut region_start = 0i64;
-    for (t, delta) in points {
-        // A new busy region opens when the first interval lifts `open`
-        // off zero; it closes when `open` returns to zero.
-        if open == 0 && delta == 1 {
-            region_start = t;
-        }
-        open += i64::from(delta);
-        if open > peak {
-            peak = open;
-        }
-        if open == 0 {
-            union += t - region_start;
-        }
-    }
-
-    (sum, union, peak)
-}
-
-/// Unioned busy time only — the single measure the compute/copy blocks
-/// need (their `sum`/`peak` are discarded). Cheaper than [`measures`]:
-/// a sort by start plus a merge sweep, with no endpoint-doubling for the
-/// peak. `intervals` is sorted in place.
-fn union_only(intervals: &mut [(i64, i64)]) -> i64 {
-    intervals.sort_unstable_by_key(|(s, _)| *s);
-    let mut union = 0i64;
-    let mut cur: Option<(i64, i64)> = None;
-    for &(s, e) in intervals.iter() {
-        match cur {
-            None => cur = Some((s, e)),
-            // Overlapping or exactly touching → extend the open run.
-            Some((cs, ce)) if s <= ce => cur = Some((cs, ce.max(e))),
-            Some((cs, ce)) => {
-                union += ce - cs;
-                cur = Some((s, e));
-            }
-        }
-    }
-    if let Some((cs, ce)) = cur {
-        union += ce - cs;
-    }
-    union
-}
-
 /// Build the windowed interval-fetch SQL across the GPU-busy kinds that
 /// exist in the trace. Projects `(device_id, stream_id, is_compute,
 /// start_ns, end_ns)`, clipping each event to the window and keeping
@@ -177,6 +114,7 @@ fn union_only(intervals: &mut [(i64, i64)]) -> i64 {
 fn fetch_sql(
     trace: &Trace,
     abs_window: Option<(i64, i64)>,
+    process_id: Option<i64>,
     device: Option<i32>,
 ) -> NsysQueryResult<(String, Vec<Value>)> {
     let dev = crate::kind_sql::GPU_DEVICE_ID_EXPR;
@@ -189,10 +127,14 @@ fn fetch_sql(
             GpuWorkClass::Compute => 1,
             GpuWorkClass::Copy => 0,
         };
+        let process =
+            veloq_nsys_data::process_sql_projection(trace, table, "t", "event_proc", "t.start");
         subqueries.push(format!(
-            "SELECT {dev} AS device_id, {stm} AS stream_id, \
+            "SELECT {process_expr} AS process_id, {dev} AS device_id, {stm} AS stream_id, \
              {compute} AS is_compute, t.start AS start_ns, t.\"end\" AS end_ns \
-             FROM nsight.{table} t"
+             FROM nsight.{table} t {process_join}",
+            process_expr = process.expr,
+            process_join = process.join,
         ));
     }
     if subqueries.is_empty() {
@@ -224,6 +166,10 @@ fn fetch_sql(
             Vec::new(),
         ),
     };
+    if let Some(process_id) = process_id {
+        where_parts.push("process_id = ?".to_string());
+        params.push(Value::BigInt(process_id));
+    }
     if let Some(device) = device {
         where_parts.push("device_id = ?".to_string());
         params.push(Value::Int(device));
@@ -236,57 +182,15 @@ fn fetch_sql(
 
     let sql = format!(
         "WITH events AS ({union}) \
-         SELECT device_id, stream_id, is_compute, \
+         SELECT process_id, device_id, stream_id, is_compute, \
          {start_expr} AS s_ns, {end_expr} AS e_ns \
          FROM events {where_clause}"
     );
     Ok((sql, params))
 }
 
-/// Per-device accumulator of clipped intervals.
-#[derive(Default)]
-struct DeviceAccum {
-    all: Vec<(i64, i64)>,
-    compute: Vec<(i64, i64)>,
-    copy: Vec<(i64, i64)>,
-    streams: BTreeMap<i64, Vec<(i64, i64)>>,
-}
-
-fn hydrate_concurrency_intervals(
-    conn: &duckdb::Connection,
-    sql: &str,
-    params: &[Value],
-) -> NsysQueryResult<BTreeMap<i32, DeviceAccum>> {
-    let mut by_device: BTreeMap<i32, DeviceAccum> = BTreeMap::new();
-    let rows = crate::query_sql::exec::query_rows(
-        conn,
-        sql,
-        params,
-        crate::query_sql::exec::CONCURRENCY_INTERVAL,
-        concurrency_interval_row,
-    )?;
-    for row in rows {
-        // A clipped interval can be empty (touches the window edge);
-        // drop those so they don't add zero-width noise.
-        if row.end_ns <= row.start_ns {
-            continue;
-        }
-        let acc = by_device.entry(row.device_id).or_default();
-        acc.all.push((row.start_ns, row.end_ns));
-        if row.is_compute != 0 {
-            acc.compute.push((row.start_ns, row.end_ns));
-        } else {
-            acc.copy.push((row.start_ns, row.end_ns));
-        }
-        acc.streams
-            .entry(row.stream_id)
-            .or_default()
-            .push((row.start_ns, row.end_ns));
-    }
-    Ok(by_device)
-}
-
-struct ConcurrencyIntervalRow {
+struct ConcurrencyInterval {
+    process_id: i64,
     device_id: i32,
     stream_id: i64,
     is_compute: i32,
@@ -294,30 +198,145 @@ struct ConcurrencyIntervalRow {
     end_ns: i64,
 }
 
-fn concurrency_interval_row(
-    row: &duckdb::Row<'_>,
-) -> Result<ConcurrencyIntervalRow, duckdb::Error> {
-    Ok(ConcurrencyIntervalRow {
-        device_id: row.get(0)?,
-        stream_id: row.get(1)?,
-        is_compute: row.get(2)?,
-        start_ns: row.get(3)?,
-        end_ns: row.get(4)?,
-    })
+fn load_concurrency_intervals(
+    conn: &duckdb::Connection,
+    sql: &str,
+    params: &[Value],
+) -> NsysQueryResult<Vec<ConcurrencyInterval>> {
+    crate::query_sql::exec::query_rows(
+        conn,
+        sql,
+        params,
+        crate::query_sql::exec::CONCURRENCY_INTERVAL,
+        |row| {
+            Ok(ConcurrencyInterval {
+                process_id: row.get(0)?,
+                device_id: row.get(1)?,
+                stream_id: row.get(2)?,
+                is_compute: row.get(3)?,
+                start_ns: row.get(4)?,
+                end_ns: row.get(5)?,
+            })
+        },
+    )
 }
 
-pub fn run<P: AsRef<Path>>(
-    path: P,
-    req: ConcurrencyRequest,
+#[derive(Default)]
+struct UnionSweep {
+    total_ns: i64,
+    current: Option<(i64, i64)>,
+}
+
+impl UnionSweep {
+    fn push_sorted(&mut self, start_ns: i64, end_ns: i64) {
+        match self.current {
+            None => self.current = Some((start_ns, end_ns)),
+            Some((current_start, current_end)) if start_ns <= current_end => {
+                self.current = Some((current_start, current_end.max(end_ns)));
+            }
+            Some((current_start, current_end)) => {
+                self.total_ns += current_end - current_start;
+                self.current = Some((start_ns, end_ns));
+            }
+        }
+    }
+
+    fn finish(mut self) -> i64 {
+        if let Some((start_ns, end_ns)) = self.current.take() {
+            self.total_ns += end_ns - start_ns;
+        }
+        self.total_ns
+    }
+}
+
+#[derive(Default)]
+struct IntervalSweep {
+    sum_ns: i64,
+    union: UnionSweep,
+    active_ends: BinaryHeap<Reverse<i64>>,
+    open_count: i64,
+    peak: i64,
+}
+
+impl IntervalSweep {
+    fn push_sorted(&mut self, start_ns: i64, end_ns: i64) {
+        self.sum_ns += end_ns - start_ns;
+        self.union.push_sorted(start_ns, end_ns);
+        while self.active_ends.peek().is_some_and(|end| end.0 <= start_ns) {
+            self.active_ends.pop();
+            self.open_count -= 1;
+        }
+        self.active_ends.push(Reverse(end_ns));
+        self.open_count += 1;
+        self.peak = self.peak.max(self.open_count);
+    }
+
+    fn finish(self) -> (i64, i64, i64) {
+        (self.sum_ns, self.union.finish(), self.peak)
+    }
+}
+
+fn aggregate_sorted_device(
+    process_id: i64,
+    device_id: i32,
+    intervals: &[ConcurrencyInterval],
+) -> DeviceConcurrency {
+    let mut device = IntervalSweep::default();
+    let mut compute = UnionSweep::default();
+    let mut copy = UnionSweep::default();
+    let mut streams = BTreeMap::<i64, IntervalSweep>::new();
+
+    for interval in intervals {
+        device.push_sorted(interval.start_ns, interval.end_ns);
+        if interval.is_compute != 0 {
+            compute.push_sorted(interval.start_ns, interval.end_ns);
+        } else {
+            copy.push_sorted(interval.start_ns, interval.end_ns);
+        }
+        streams
+            .entry(interval.stream_id)
+            .or_default()
+            .push_sorted(interval.start_ns, interval.end_ns);
+    }
+
+    let (sum_busy_ns, union_busy_ns, max_concurrency) = device.finish();
+    let compute_union_ns = compute.finish();
+    let copy_union_ns = copy.finish();
+    DeviceConcurrency {
+        key: format!("concurrency|pid:{process_id}|dev:{device_id}"),
+        process_id,
+        device_id,
+        sum_busy_ns,
+        union_busy_ns,
+        overlap_ns: sum_busy_ns - union_busy_ns,
+        max_concurrency,
+        compute_vs_copy: ComputeVsCopy {
+            compute_union_ns,
+            copy_union_ns,
+            compute_copy_overlap_ns: compute_union_ns + copy_union_ns - union_busy_ns,
+        },
+        streams: streams
+            .into_iter()
+            .map(|(stream_id, sweep)| {
+                let (sum_busy_ns, union_busy_ns, max_concurrency) = sweep.finish();
+                StreamConcurrency {
+                    stream_id,
+                    sum_busy_ns,
+                    union_busy_ns,
+                    overlap_ns: sum_busy_ns - union_busy_ns,
+                    max_concurrency,
+                }
+            })
+            .collect(),
+    }
+}
+
+fn optimized_run(
+    trace: &Trace,
+    req: &ConcurrencyRequest,
+    abs_window: Option<(i64, i64)>,
 ) -> NsysQueryResult<ConcurrencyResponse> {
-    crate::check_limit(req.limit)?;
-
-    let trace = Trace::open(path).map_err(NsysQueryError::trace_open)?;
-    let abs_window = trace
-        .resolve_window(req.time_window)
-        .map_err(NsysQueryError::time_window_resolve)?;
-
-    let (sql, params) = fetch_sql(&trace, abs_window, req.device)?;
+    let (sql, params) = fetch_sql(trace, abs_window, req.process_id, req.device)?;
     if sql.is_empty() {
         return Ok(ConcurrencyResponse {
             count: 0,
@@ -326,178 +345,211 @@ pub fn run<P: AsRef<Path>>(
             rows: Vec::new(),
         });
     }
+    let mut intervals = load_concurrency_intervals(trace.conn(), &sql, &params)?;
+    intervals.retain(|interval| interval.end_ns > interval.start_ns);
+    let pool = trace
+        .build_query_worker_pool()
+        .map_err(NsysQueryError::data)?;
+    pool.install(|| intervals.par_sort_unstable_by_key(concurrency_interval_order));
 
-    let by_device = hydrate_concurrency_intervals(trace.conn(), &sql, &params)?;
-
-    let total_matched = by_device.len() as i64;
-
-    let mut device_rows: Vec<DeviceConcurrency> = Vec::with_capacity(by_device.len());
-    for (device_id, mut acc) in by_device {
-        let (sum_busy_ns, union_busy_ns, max_concurrency) = measures(&acc.all);
-        let compute_union_ns = union_only(&mut acc.compute);
-        let copy_union_ns = union_only(&mut acc.copy);
-        // Inclusion-exclusion: the time both a compute and a copy event
-        // ran is |compute| + |copy| − |compute ∪ copy|, and
-        // compute ∪ copy is exactly the device union.
-        let compute_copy_overlap_ns = compute_union_ns + copy_union_ns - union_busy_ns;
-
-        let streams: Vec<StreamConcurrency> = acc
-            .streams
-            .into_iter()
-            .map(|(stream_id, iv)| {
-                let (sum, union, maxc) = measures(&iv);
-                StreamConcurrency {
-                    stream_id,
-                    sum_busy_ns: sum,
-                    union_busy_ns: union,
-                    overlap_ns: sum - union,
-                    max_concurrency: maxc,
-                }
+    let groups = intervals
+        .chunk_by(|left, right| {
+            left.process_id == right.process_id && left.device_id == right.device_id
+        })
+        .collect::<Vec<_>>();
+    let total_matched = groups.len() as i64;
+    let aggregate = || {
+        groups
+            .par_iter()
+            .take(req.limit)
+            .filter_map(|group| {
+                group
+                    .first()
+                    .map(|first| aggregate_sorted_device(first.process_id, first.device_id, group))
             })
-            .collect();
-
-        device_rows.push(DeviceConcurrency {
-            key: format!("concurrency|dev:{device_id}"),
-            device_id,
-            sum_busy_ns,
-            union_busy_ns,
-            overlap_ns: sum_busy_ns - union_busy_ns,
-            max_concurrency,
-            compute_vs_copy: ComputeVsCopy {
-                compute_union_ns,
-                copy_union_ns,
-                compute_copy_overlap_ns,
-            },
-            streams,
-        });
-    }
-
-    device_rows.truncate(req.limit);
+            .collect()
+    };
+    let rows: Vec<DeviceConcurrency> = pool.install(aggregate);
 
     Ok(ConcurrencyResponse {
-        count: device_rows.len(),
+        count: rows.len(),
         total_matched,
         time_window_ns: abs_window,
-        rows: device_rows,
+        rows,
     })
+}
+
+fn concurrency_interval_order(interval: &ConcurrencyInterval) -> (i64, i32, i64, i64, i64) {
+    (
+        interval.process_id,
+        interval.device_id,
+        interval.start_ns,
+        interval.end_ns,
+        interval.stream_id,
+    )
+}
+
+pub fn run<P: AsRef<Path>>(
+    path: P,
+    req: ConcurrencyRequest,
+) -> NsysQueryResult<ConcurrencyResponse> {
+    crate::check_limit(req.limit)?;
+    let trace = Trace::open(path).map_err(NsysQueryError::trace_open)?;
+    run_after_limit(&trace, req)
+}
+
+pub fn run_with_trace(
+    trace: &Trace,
+    req: ConcurrencyRequest,
+) -> NsysQueryResult<ConcurrencyResponse> {
+    crate::check_limit(req.limit)?;
+    run_after_limit(trace, req)
+}
+
+pub fn run_with_index(
+    trace: &Trace,
+    index: &crate::resident_intervals::ResidentIntervalIndex,
+    req: ConcurrencyRequest,
+) -> NsysQueryResult<ConcurrencyResponse> {
+    crate::check_limit(req.limit)?;
+    let abs_window = trace
+        .resolve_window(req.time_window)
+        .map_err(NsysQueryError::time_window_resolve)?;
+    let devices = index
+        .selected_devices(req.process_id, req.device)
+        .collect::<Vec<_>>();
+    let pool = trace
+        .build_query_worker_pool()
+        .map_err(NsysQueryError::data)?;
+    let activities = pool.install(|| {
+        devices
+            .par_iter()
+            .filter_map(|device| {
+                let activity = device.activity(abs_window);
+                if activity.sum_busy_ns > 0 {
+                    Some((device.process_id(), device.device_id(), activity))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    });
+    let total_matched = activities.len() as i64;
+    let rows = activities
+        .into_iter()
+        .take(req.limit)
+        .map(|(process_id, device_id, activity)| {
+            device_activity_row(process_id, device_id, activity)
+        })
+        .collect::<Vec<_>>();
+    Ok(ConcurrencyResponse {
+        count: rows.len(),
+        total_matched,
+        time_window_ns: abs_window,
+        rows,
+    })
+}
+
+fn device_activity_row(
+    process_id: i64,
+    device_id: i32,
+    activity: crate::resident_intervals::DeviceActivityEvidence,
+) -> DeviceConcurrency {
+    DeviceConcurrency {
+        key: format!("concurrency|pid:{process_id}|dev:{device_id}"),
+        process_id,
+        device_id,
+        sum_busy_ns: activity.sum_busy_ns,
+        union_busy_ns: activity.union_busy_ns,
+        overlap_ns: activity.sum_busy_ns - activity.union_busy_ns,
+        max_concurrency: activity.max_concurrency,
+        compute_vs_copy: ComputeVsCopy {
+            compute_union_ns: activity.compute_union_ns,
+            copy_union_ns: activity.copy_union_ns,
+            compute_copy_overlap_ns: activity.compute_union_ns + activity.copy_union_ns
+                - activity.union_busy_ns,
+        },
+        streams: activity
+            .streams
+            .into_iter()
+            .map(|stream| StreamConcurrency {
+                stream_id: stream.stream_id,
+                sum_busy_ns: stream.sum_busy_ns,
+                union_busy_ns: stream.union_busy_ns,
+                overlap_ns: stream.sum_busy_ns - stream.union_busy_ns,
+                max_concurrency: stream.max_concurrency,
+            })
+            .collect(),
+    }
+}
+
+fn run_after_limit(trace: &Trace, req: ConcurrencyRequest) -> NsysQueryResult<ConcurrencyResponse> {
+    let abs_window = trace
+        .resolve_window(req.time_window)
+        .map_err(NsysQueryError::time_window_resolve)?;
+
+    optimized_run(trace, &req, abs_window)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Result;
-    use veloq_core::VeloqDiagnostic;
+    use anyhow::Context as _;
 
     #[test]
-    fn measures_serial_back_to_back_has_no_overlap() {
-        // [0,10) then [10,20): contiguous union 20, no overlap, peak 1.
-        let (sum, union, peak) = measures(&[(0, 10), (10, 20)]);
-        assert_eq!(sum, 20);
-        assert_eq!(union, 20);
-        assert_eq!(sum - union, 0);
-        assert_eq!(peak, 1);
-    }
+    fn sorted_sweep_preserves_half_open_overlap_math() -> anyhow::Result<()> {
+        let intervals = [
+            ConcurrencyInterval {
+                process_id: 12345,
+                device_id: 0,
+                stream_id: 7,
+                is_compute: 1,
+                start_ns: 0,
+                end_ns: 60,
+            },
+            ConcurrencyInterval {
+                process_id: 12345,
+                device_id: 0,
+                stream_id: 8,
+                is_compute: 0,
+                start_ns: 30,
+                end_ns: 90,
+            },
+            ConcurrencyInterval {
+                process_id: 12345,
+                device_id: 0,
+                stream_id: 7,
+                is_compute: 1,
+                start_ns: 50,
+                end_ns: 100,
+            },
+            ConcurrencyInterval {
+                process_id: 12345,
+                device_id: 0,
+                stream_id: 8,
+                is_compute: 0,
+                start_ns: 100,
+                end_ns: 110,
+            },
+        ];
+        let device = aggregate_sorted_device(12345, 0, &intervals);
 
-    #[test]
-    fn measures_counts_overlap_and_peak() {
-        // [0,60),[50,100),[30,90): sum 170, union [0,100)=100, overlap
-        // 70, and at [50,60) all three are open → peak 3.
-        let (sum, union, peak) = measures(&[(0, 60), (50, 100), (30, 90)]);
-        assert_eq!(sum, 170);
-        assert_eq!(union, 100);
-        assert_eq!(sum - union, 70);
-        assert_eq!(peak, 3);
-    }
-
-    #[test]
-    fn measures_same_stream_pdl_overlap_is_counted() {
-        // PDL: successor [50,100) starts before predecessor [0,60)
-        // retires → 10 of overlap, peak 2 (no serial assumption).
-        let (sum, union, peak) = measures(&[(0, 60), (50, 100)]);
-        assert_eq!(sum, 110);
-        assert_eq!(union, 100);
-        assert_eq!(sum - union, 10);
-        assert_eq!(peak, 2);
-    }
-
-    #[test]
-    fn hydrate_concurrency_intervals_prepare_error_is_typed() -> Result<()> {
-        let conn = duckdb::Connection::open_in_memory()?;
-
-        let err = match hydrate_concurrency_intervals(&conn, "SELECT * FROM", &[]) {
-            Ok(rows) => anyhow::bail!(
-                "malformed concurrency SQL should not hydrate successfully: {} devices",
-                rows.len()
-            ),
-            Err(err) => err,
-        };
-
-        assert_eq!(err.code().as_str(), "nsys.query.sql-prepare");
-        assert!(matches!(
-            err,
-            crate::NsysQueryError::Sql {
-                phase: crate::SqlPhase::Prepare,
-                ..
-            }
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn hydrate_concurrency_intervals_query_error_is_typed() -> Result<()> {
-        let conn = duckdb::Connection::open_in_memory()?;
-        let sql = "SELECT \
-                   ? AS device_id, \
-                   0::BIGINT AS stream_id, \
-                   1::INTEGER AS is_compute, \
-                   0::BIGINT AS s_ns, \
-                   10::BIGINT AS e_ns";
-
-        let err = match hydrate_concurrency_intervals(&conn, sql, &[]) {
-            Ok(rows) => anyhow::bail!(
-                "unbound concurrency SQL parameter should not hydrate successfully: {} devices",
-                rows.len()
-            ),
-            Err(err) => err,
-        };
-
-        assert_eq!(err.code().as_str(), "nsys.query.sql-query");
-        assert!(matches!(
-            err,
-            crate::NsysQueryError::Sql {
-                phase: crate::SqlPhase::Query,
-                ..
-            }
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn hydrate_concurrency_intervals_read_error_is_typed() -> Result<()> {
-        let conn = duckdb::Connection::open_in_memory()?;
-        let sql = "SELECT \
-                   'not-a-device' AS device_id, \
-                   0::BIGINT AS stream_id, \
-                   1::INTEGER AS is_compute, \
-                   0::BIGINT AS s_ns, \
-                   10::BIGINT AS e_ns";
-
-        let err = match hydrate_concurrency_intervals(&conn, sql, &[]) {
-            Ok(rows) => anyhow::bail!(
-                "malformed concurrency row should not hydrate successfully: {} devices",
-                rows.len()
-            ),
-            Err(err) => err,
-        };
-
-        assert_eq!(err.code().as_str(), "nsys.query.sql-read");
-        assert!(matches!(
-            err,
-            crate::NsysQueryError::Sql {
-                phase: crate::SqlPhase::Read,
-                ..
-            }
-        ));
+        assert_eq!(device.sum_busy_ns, 180);
+        assert_eq!(device.union_busy_ns, 110);
+        assert_eq!(device.overlap_ns, 70);
+        assert_eq!(device.max_concurrency, 3);
+        assert_eq!(device.compute_vs_copy.compute_union_ns, 100);
+        assert_eq!(device.compute_vs_copy.copy_union_ns, 70);
+        assert_eq!(device.compute_vs_copy.compute_copy_overlap_ns, 60);
+        assert_eq!(device.streams.len(), 2);
+        let first_stream = device.streams.first().context("missing first stream")?;
+        assert_eq!(first_stream.stream_id, 7);
+        assert_eq!(first_stream.union_busy_ns, 100);
+        assert_eq!(first_stream.max_concurrency, 2);
+        let second_stream = device.streams.get(1).context("missing second stream")?;
+        assert_eq!(second_stream.stream_id, 8);
+        assert_eq!(second_stream.union_busy_ns, 70);
+        assert_eq!(second_stream.max_concurrency, 1);
         Ok(())
     }
 }

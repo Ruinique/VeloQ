@@ -18,9 +18,10 @@ use duckdb::types::Value;
 use group_by::{GroupBySql, HistSql, resolve_name_axis, stats_sort_sql};
 use hydrate::{build_bucket_schema, hydrate_stats_rows};
 use serde::Serialize;
-use sql::{NVTX_STYLE_EXPR, per_kind_subquery};
+use sql::{NVTX_STYLE_EXPR, PerKindSubqueryOptions, per_kind_subquery};
 use std::path::Path;
 use veloq_core::{SortSpec, time::TimeWindow};
+use veloq_nsys_data::Trace;
 
 /// Event kinds that `stats` is willing to aggregate. Library consumers
 /// constructing `StatsRequest` by hand should pick from this set; CLI
@@ -78,6 +79,8 @@ pub struct StatsRequest {
     /// When set, only aggregate over GPU events causally attributable
     /// to NVTX ranges whose name matches this glob (`*`/`?`).
     pub nvtx: Option<String>,
+    /// Restrict to one native process owning the CUDA namespace.
+    pub process_id: Option<i64>,
     /// Restrict to one CUDA device (NSys `deviceId`).
     pub device: Option<i32>,
     /// Restrict to one CUDA stream (NSys `streamId`).
@@ -130,6 +133,7 @@ impl Default for StatsRequest {
             group_by: GroupBy::default(),
             time_window: None,
             nvtx: None,
+            process_id: None,
             device: None,
             stream: None,
             hist: false,
@@ -215,6 +219,9 @@ pub struct StatRow {
     /// nvtx) and when the name axis is `no-name`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub short_name: Option<String>,
+    /// Native process owning any process-local CUDA axes on this row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<i64>,
     /// Physical-dimension columns. Each is populated only when the
     /// corresponding axis is part of `--group-by`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -343,7 +350,20 @@ pub struct StatRow {
 }
 
 pub fn run<P: AsRef<Path>>(path: P, req: StatsRequest) -> NsysQueryResult<StatsResponse> {
-    let (trace, abs_window) = crate::open_scoped(path.as_ref(), req.limit, req.time_window)?;
+    crate::check_limit(req.limit)?;
+    let trace = Trace::open(path).map_err(NsysQueryError::trace_open)?;
+    run_after_limit(&trace, req)
+}
+
+pub fn run_with_trace(trace: &Trace, req: StatsRequest) -> NsysQueryResult<StatsResponse> {
+    crate::check_limit(req.limit)?;
+    run_after_limit(trace, req)
+}
+
+fn run_after_limit(trace: &Trace, req: StatsRequest) -> NsysQueryResult<StatsResponse> {
+    let abs_window = trace
+        .resolve_window(req.time_window)
+        .map_err(NsysQueryError::time_window_resolve)?;
 
     // Defence-in-depth: hand-built `StatsRequest`s with non-stats
     // kinds get rejected here too. CLI callers go through
@@ -365,6 +385,7 @@ pub fn run<P: AsRef<Path>>(path: P, req: StatsRequest) -> NsysQueryResult<StatsR
     crate::kind_policy::validate_location_filter(
         &req.kinds,
         crate::kind_policy::LocationFilter {
+            process_id: req.process_id,
             device: req.device,
             stream: req.stream,
         },
@@ -507,7 +528,7 @@ pub fn run<P: AsRef<Path>>(path: P, req: StatsRequest) -> NsysQueryResult<StatsR
         &req.kinds,
         req.nvtx.as_deref(),
         &ALLOWED_KINDS,
-        &trace,
+        trace,
         "stats",
     )?
     .into_iter()
@@ -535,18 +556,26 @@ pub fn run<P: AsRef<Path>>(path: P, req: StatsRequest) -> NsysQueryResult<StatsR
     }
 
     let attribution = match req.nvtx.as_deref() {
-        Some(p) => Some(crate::nvtx_attribution::build(p, &kinds, &trace)?),
+        Some(p) => Some(crate::nvtx_attribution::build(p, &kinds, trace)?),
         None => None,
     };
 
-    // Probe schema once so optional columns (currently only
-    // `mangledName` on the kernel table) can resolve to
+    // Probe schema once so optional columns (`mangledName` on the
+    // kernel table; `graphId` / `graphNodeId` on kernel/memcpy/memset,
+    // which Nsight 2025.3 node-mode exports may omit) can resolve to
     // a real ref or NULL without a per-kind reprobe inside
     // `per_kind_subquery`. The probe is cheap (one
     // information_schema query) and the result is also consulted to
     // pick the effective name axis when `--group-by mangled` would
     // otherwise hit an absent column.
-    let columns = crate::column_map::load_columns(trace.conn(), &["CUPTI_ACTIVITY_KIND_KERNEL"])?;
+    let columns = crate::column_map::load_columns(
+        trace.conn(),
+        &[
+            "CUPTI_ACTIVITY_KIND_KERNEL",
+            "CUPTI_ACTIVITY_KIND_MEMCPY",
+            "CUPTI_ACTIVITY_KIND_MEMSET",
+        ],
+    )?;
     let axis_resolution = resolve_name_axis(req.group_by.name, &columns);
     let effective_group_by = GroupBy {
         name: axis_resolution.effective,
@@ -571,7 +600,7 @@ pub fn run<P: AsRef<Path>>(path: P, req: StatsRequest) -> NsysQueryResult<StatsR
     // NVTX + binary-search-and-walk-back gives an
     // `O(N_runtime × log N_nvtx + matches)` build cost.
     let nvtx_parent_sidecar: Option<std::path::PathBuf> = if group_by_nvtx_hierarchy {
-        let path = veloq_nsys_data::runtime_nvtx_parent::ensure_sidecar(&trace)
+        let path = veloq_nsys_data::runtime_nvtx_parent::ensure_sidecar(trace)
             .map_err(NsysQueryError::nvtx_parent_sidecar_ensure)?;
         Some(path)
     } else {
@@ -584,25 +613,25 @@ pub fn run<P: AsRef<Path>>(path: P, req: StatsRequest) -> NsysQueryResult<StatsR
     // to an empty map — domain *identity* still works, only the human
     // name is missing. Never fail the verb over a name lookup.
     let domain_names: std::collections::HashMap<(i64, i64), String> = if req.group_by.nvtx_path {
-        veloq_nsys_data::nvtx_tree::ensure_sidecar(&trace)
+        veloq_nsys_data::nvtx_tree::ensure_sidecar(trace)
             .map_err(NsysQueryError::nvtx_tree_load)?;
-        veloq_nsys_data::trace_map::nvtx_domain_names(&trace).unwrap_or_default()
+        veloq_nsys_data::trace_map::nvtx_domain_names(trace).unwrap_or_default()
     } else {
         std::collections::HashMap::new()
     };
 
     let mut subqueries: Vec<String> = Vec::with_capacity(kinds.len());
     let mut per_kind_params: Vec<Value> = Vec::new();
+    let subquery_options = PerKindSubqueryOptions {
+        abs_window,
+        nvtx_scope,
+        collapse_versioned: req.collapse_versioned,
+        columns: &columns,
+        nvtx_parent_sidecar: nvtx_parent_sidecar.as_deref(),
+        include_nvtx_path: req.group_by.nvtx_path,
+    };
     for kind in &kinds {
-        let (sql, params) = per_kind_subquery(
-            *kind,
-            abs_window,
-            nvtx_scope,
-            req.collapse_versioned,
-            &columns,
-            nvtx_parent_sidecar.as_deref(),
-            req.group_by.nvtx_path,
-        )?;
+        let (sql, params) = per_kind_subquery(trace, *kind, &subquery_options)?;
         subqueries.push(sql);
         per_kind_params.extend(params);
     }
@@ -631,6 +660,7 @@ pub fn run<P: AsRef<Path>>(path: P, req: StatsRequest) -> NsysQueryResult<StatsR
     let GroupBySql {
         name_select,
         short_name_select,
+        process_select,
         device_select,
         context_select,
         stream_select,
@@ -660,6 +690,7 @@ pub fn run<P: AsRef<Path>>(path: P, req: StatsRequest) -> NsysQueryResult<StatsR
     let mut location_where = String::new();
     let mut location_params: Vec<Value> = Vec::new();
     crate::kind_policy::LocationFilter {
+        process_id: req.process_id,
         device: req.device,
         stream: req.stream,
     }
@@ -673,6 +704,7 @@ pub fn run<P: AsRef<Path>>(path: P, req: StatsRequest) -> NsysQueryResult<StatsR
                 {name_select},
                 {short_name_select},
                 kind,
+                {process_select},
                 {device_select},
                 {context_select},
                 {stream_select},
@@ -713,7 +745,7 @@ pub fn run<P: AsRef<Path>>(path: P, req: StatsRequest) -> NsysQueryResult<StatsR
             GROUP BY {group_keys_sql}
         )
         SELECT
-            name, short_name, kind,
+            name, short_name, kind, process_id,
             device_id, context_id, stream_id,
             graph_id, graph_node_id,
             nvtx_parent_rowid, nvtx_parent_name, nvtx_path,
@@ -767,7 +799,7 @@ pub fn run<P: AsRef<Path>>(path: P, req: StatsRequest) -> NsysQueryResult<StatsR
         None
     };
     let (mut out, scope) = hydrate_stats_rows(
-        &trace,
+        trace,
         &sql,
         &params,
         req.hist,

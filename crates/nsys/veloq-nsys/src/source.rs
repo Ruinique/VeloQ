@@ -6,14 +6,21 @@
 //! [`crate::cli::Cmd`] + [`crate::help`]), and the run glue that
 //! hands off to [`crate::commands::run`].
 
-use crate::cli::Cmd;
+use crate::cli::{
+    CONCURRENCY_COMMAND, CORRELATE_COMMAND, Cmd, GAPS_COMMAND, GRAPH_REPLAYS_COMMAND,
+    INSPECT_COMMAND, NCU_COMMAND, SEARCH_COMMAND, SLICES_COMMAND, STATS_COMMAND, SUMMARY_COMMAND,
+    TIMELINE_COMMAND,
+};
 use crate::commands;
 use crate::error::NsysSourceError;
 use crate::help::inject_long_about;
 use clap::{Command, FromArgMatches, Subcommand};
 use std::path::Path;
 use veloq_core::source::{OutputFormat, ProfileSource};
-use veloq_core::{SourceRunResult, TraceSpan};
+use veloq_core::{
+    CancellationToken, ProfileSession, SourceExecution, SourceQueryContext, SourceRunResult,
+    SourceSessionConfig, SourceSessionIdentity, TraceSpan,
+};
 
 pub struct NsysSource;
 
@@ -28,15 +35,25 @@ impl NsysSource {
     /// NSys data structures (StatsResponse, SummaryResponse, …), not
     /// the envelope wrapping them.
     ///
-    /// Every list response is canonical `data.rows[]` with a per-row
-    /// `key`, and event rows share the `EventRef` type. `stats
-    /// --group-by nvtx-path` rows carry the NVTX domain dimension: the
-    /// primary row `key` gains a `domain:<pid>:<domainId>` component and
-    /// each real nvtx-path row carries the resolved domain identity
-    /// (`domain_id`, `domain_pid`) plus its `domain_name` when
-    /// registered. Same-name/same-parent ranges in distinct
-    /// `(pid, domainId)` domains stay distinct.
-    pub const VERSION: &'static str = "v3";
+    /// Version `v4` makes process identity part of every process-local
+    /// CUDA identity and row key. Rank processes that each expose
+    /// logical device 0 therefore remain distinct across graph replay,
+    /// correlation, NVTX attribution, aggregation, gap, and
+    /// visualization responses.
+    pub const VERSION: &'static str = "v4";
+    pub const DAEMON_COMMANDS: &'static [&'static str] = &[
+        SUMMARY_COMMAND,
+        SEARCH_COMMAND,
+        INSPECT_COMMAND,
+        CORRELATE_COMMAND,
+        STATS_COMMAND,
+        TIMELINE_COMMAND,
+        CONCURRENCY_COMMAND,
+        GAPS_COMMAND,
+        SLICES_COMMAND,
+        GRAPH_REPLAYS_COMMAND,
+        NCU_COMMAND,
+    ];
 }
 
 impl ProfileSource for NsysSource {
@@ -96,7 +113,126 @@ impl ProfileSource for NsysSource {
         inject_long_about(parent)
     }
 
-    fn run(&self, matches: &clap::ArgMatches, fmt: OutputFormat) -> SourceRunResult<i32> {
+    fn daemon_command_verbs(&self) -> &'static [&'static str] {
+        Self::DAEMON_COMMANDS
+    }
+
+    fn daemon_session_identity(
+        &self,
+        trace: &Path,
+    ) -> SourceRunResult<Option<SourceSessionIdentity>> {
+        let identity = veloq_nsys_data::resident_trace_identity(trace)?;
+        Ok(Some(SourceSessionIdentity {
+            trace_kind: "nsys".to_string(),
+            canonical_trace_path: identity.canonical_source_path,
+            configuration_key: String::new(),
+            freshness_key: identity.freshness_key,
+            resident_memory_estimate_bytes: identity.resident_memory_estimate_bytes,
+        }))
+    }
+
+    fn open_daemon_session(
+        &self,
+        resolved_trace: &Path,
+        config: SourceSessionConfig,
+    ) -> SourceRunResult<Option<Box<dyn ProfileSession>>> {
+        let worker_threads = usize::try_from(config.query_workers)?;
+        Ok(Some(Box::new(NsysProfileSession {
+            trace: veloq_nsys_data::Trace::open_for_daemon(
+                resolved_trace,
+                worker_threads,
+                config.query_memory_bytes,
+            )?,
+            interval_index: None,
+            interval_index_attempted: false,
+            interval_reuse_observed: false,
+            resident_memory_ceiling_bytes: config.resident_memory_bytes,
+            graph_index_attempted: false,
+        })))
+    }
+
+    fn query_context(&self, matches: &clap::ArgMatches) -> SourceRunResult<SourceQueryContext> {
+        let cmd = Cmd::from_arg_matches(matches)?;
+        Ok(SourceQueryContext {
+            command: format!("{}.{}", Self::KIND, cmd.name()),
+            trace_path: cmd.trace_path().map(Path::to_path_buf),
+            raw_stdout: cmd.raw_stdout(),
+        })
+    }
+
+    fn execute(
+        &self,
+        matches: &clap::ArgMatches,
+        fmt: OutputFormat,
+    ) -> SourceRunResult<SourceExecution> {
+        self.execute_with_trace(matches, fmt, None, None, None)
+    }
+
+    fn execute_daemon(
+        &self,
+        matches: &clap::ArgMatches,
+        fmt: OutputFormat,
+        resolved_trace: &Path,
+    ) -> SourceRunResult<SourceExecution> {
+        self.execute_with_trace(matches, fmt, Some(resolved_trace), None, None)
+    }
+
+    fn execute_daemon_cancellable(
+        &self,
+        matches: &clap::ArgMatches,
+        fmt: OutputFormat,
+        resolved_trace: &Path,
+        config: SourceSessionConfig,
+        cancellation: &CancellationToken,
+    ) -> SourceRunResult<SourceExecution> {
+        if cancellation.is_cancelled() {
+            return Err(
+                std::io::Error::new(std::io::ErrorKind::Interrupted, "query cancelled").into(),
+            );
+        }
+        let worker_threads = usize::try_from(config.query_workers)?;
+        let trace = match veloq_nsys_data::Trace::open_for_daemon(
+            resolved_trace,
+            worker_threads,
+            config.query_memory_bytes,
+        ) {
+            Ok(trace) => trace,
+            Err(error) => {
+                let cmd = Cmd::from_arg_matches(matches)?;
+                let trace_path = cmd.trace_path().map(Path::to_path_buf);
+                let trace_span = self.compute_trace_span(resolved_trace);
+                return Ok(render_command_error(
+                    cmd.name(),
+                    cmd.raw_stdout(),
+                    trace_path.as_deref(),
+                    Some(resolved_trace),
+                    trace_span,
+                    &error.into(),
+                    fmt,
+                ));
+            }
+        };
+        let mut session = NsysProfileSession {
+            trace,
+            interval_index: None,
+            interval_index_attempted: false,
+            interval_reuse_observed: false,
+            resident_memory_ceiling_bytes: config.resident_memory_bytes,
+            graph_index_attempted: false,
+        };
+        session.execute(matches, fmt, cancellation)
+    }
+}
+
+impl NsysSource {
+    fn execute_with_trace(
+        &self,
+        matches: &clap::ArgMatches,
+        fmt: OutputFormat,
+        resolved_trace: Option<&Path>,
+        resident_trace: Option<&veloq_nsys_data::Trace>,
+        resident_intervals: Option<&veloq_nsys_query::resident_intervals::ResidentIntervalIndex>,
+    ) -> SourceRunResult<SourceExecution> {
         // Parse the matches back into the typed `Cmd`. The clap
         // dance happens twice (binary builds the same tree, parses
         // once for global `--format`; we parse this subtree again to
@@ -116,22 +252,155 @@ impl ProfileSource for NsysSource {
         // still carries the normalization denominator.
         let trace_span = trace_path
             .as_deref()
-            .and_then(|p| self.compute_trace_span(p));
-        match commands::run(cmd, fmt, trace_path.as_deref(), trace_span) {
-            Ok(code) => Ok(code),
+            .map(|path| resolved_trace.unwrap_or(path))
+            .and_then(|path| self.compute_trace_span(path));
+        let mut output = SourceExecution::new();
+        let resident = resident_trace.map(|trace| commands::ResidentQueryState {
+            trace,
+            intervals: resident_intervals,
+        });
+        match commands::run(
+            cmd,
+            fmt,
+            trace_path.as_deref(),
+            resolved_trace,
+            resident,
+            trace_span,
+            &mut output,
+        ) {
+            Ok(code) => {
+                output.set_exit_code(code);
+                Ok(output)
+            }
             Err(err) => {
-                if raw_stdout {
-                    eprintln!("veloq: {err}");
-                    return Ok(1);
-                }
-                // Emit the verb-context error envelope before
-                // returning so agents pipe a single structured
-                // failure document on stdout. The non-zero exit
-                // code propagates via the `Ok(1)` return.
-                emit_err(verb, trace_path.as_deref(), trace_span, &err, fmt);
-                Ok(1)
+                let evidence_trace = trace_path
+                    .as_deref()
+                    .map(|path| resolved_trace.unwrap_or(path));
+                Ok(render_command_error(
+                    verb,
+                    raw_stdout,
+                    trace_path.as_deref(),
+                    evidence_trace,
+                    trace_span,
+                    &err,
+                    fmt,
+                ))
             }
         }
+    }
+}
+
+struct NsysProfileSession {
+    trace: veloq_nsys_data::Trace,
+    interval_index: Option<veloq_nsys_query::resident_intervals::ResidentIntervalIndex>,
+    interval_index_attempted: bool,
+    interval_reuse_observed: bool,
+    resident_memory_ceiling_bytes: u64,
+    graph_index_attempted: bool,
+}
+
+impl ProfileSession for NsysProfileSession {
+    fn execute(
+        &mut self,
+        matches: &clap::ArgMatches,
+        fmt: OutputFormat,
+        cancellation: &CancellationToken,
+    ) -> SourceRunResult<SourceExecution> {
+        if cancellation.is_cancelled() {
+            return Err(
+                std::io::Error::new(std::io::ErrorKind::Interrupted, "query cancelled").into(),
+            );
+        }
+        let interrupt = self.trace.conn().interrupt_handle();
+        cancellation.register_interrupt(move || interrupt.interrupt());
+        let command = Cmd::from_arg_matches(matches)?;
+        let interval_command = match &command {
+            Cmd::Timeline { gpu, .. } => gpu.nvtx.is_none(),
+            Cmd::Concurrency { .. } | Cmd::Gaps { .. } => true,
+            _ => false,
+        };
+        if self.interval_index.is_none()
+            && !self.interval_index_attempted
+            && interval_command
+            && veloq_nsys_data::gpu_work_events::view_available(&self.trace)
+        {
+            if !self.interval_reuse_observed {
+                self.interval_reuse_observed = true;
+            } else {
+                self.interval_index_attempted = true;
+                match veloq_nsys_query::resident_intervals::build(
+                    &self.trace,
+                    self.resident_memory_ceiling_bytes,
+                ) {
+                    Ok(Some(index)) => {
+                        if cancellation.is_cancelled() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "query cancelled",
+                            )
+                            .into());
+                        }
+                        self.interval_index = Some(index);
+                    }
+                    Ok(None) => {
+                        log::debug!(
+                            "resident intervals: index is ineligible or cannot fit; using established query paths"
+                        );
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "resident intervals: session-local index build failed; using established query paths: {error:#}"
+                        );
+                    }
+                }
+            }
+        }
+        if !self.graph_index_attempted && command.name() == GRAPH_REPLAYS_COMMAND {
+            self.graph_index_attempted = true;
+            match veloq_nsys_query::graph_replays::ensure_resident_index(&self.trace) {
+                Ok(true) => {}
+                Ok(false) => {
+                    log::debug!(
+                        "resident graph replays: no replay evidence; using established query path"
+                    );
+                }
+                Err(error) => {
+                    log::warn!(
+                        "resident graph replays: session-local build failed; using established query path: {error:#}"
+                    );
+                }
+            }
+        }
+        let execution = NsysSource.execute_with_trace(
+            matches,
+            fmt,
+            Some(self.trace.path()),
+            Some(&self.trace),
+            self.interval_index.as_ref(),
+        );
+        if cancellation.is_cancelled() {
+            return Err(
+                std::io::Error::new(std::io::ErrorKind::Interrupted, "query cancelled").into(),
+            );
+        }
+        execution
+    }
+
+    fn additional_resident_memory_estimate_bytes(&self) -> u64 {
+        let query_engine_bytes = self
+            .trace
+            .query_engine_resident_memory_estimate_bytes()
+            .unwrap_or_else(|error| {
+                log::warn!("duckdb resident memory could not be accounted: {error:#}");
+                u64::MAX
+            });
+        query_engine_bytes
+            .saturating_add(self.trace.additional_resident_memory_estimate_bytes())
+            .saturating_add(
+                self.interval_index
+                    .as_ref()
+                    .map_or(0, |index| index.retained_memory_estimate_bytes()),
+            )
     }
 }
 
@@ -141,14 +410,36 @@ fn emit_err(
     trace_span: Option<TraceSpan>,
     err: &NsysSourceError,
     fmt: OutputFormat,
+    output: &mut SourceExecution,
 ) {
-    crate::output::emit_error(verb, trace, trace_span, err, fmt);
+    crate::output::emit_error(verb, trace, trace_span, err, fmt, output);
+}
+
+fn render_command_error(
+    verb: &str,
+    raw_stdout: bool,
+    trace: Option<&Path>,
+    evidence_trace: Option<&Path>,
+    trace_span: Option<TraceSpan>,
+    error: &NsysSourceError,
+    fmt: OutputFormat,
+) -> SourceExecution {
+    let mut output = SourceExecution::new();
+    if raw_stdout {
+        output.write_stderr_line(format!("veloq: {error}"));
+    } else {
+        let trace_span = trace_span
+            .or_else(|| evidence_trace.and_then(veloq_nsys_data::meta_cache::trace_span_for_path));
+        emit_err(verb, trace, trace_span, error, fmt, &mut output);
+    }
+    output.set_exit_code(1);
+    output
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Result;
+    use anyhow::{Context, Result};
     use std::collections::BTreeSet;
     use std::fs;
 
@@ -186,6 +477,31 @@ mod tests {
         .collect();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn process_filter_is_exposed_on_every_standard_process_sensitive_list_verb() -> Result<()> {
+        let command = NsysSource.cli();
+        for name in [
+            "stats",
+            "search",
+            "graph-replays",
+            "concurrency",
+            "gaps",
+            "timeline",
+            "slices",
+        ] {
+            let subcommand = command
+                .find_subcommand(name)
+                .with_context(|| format!("missing {name} subcommand"))?;
+            assert!(
+                subcommand
+                    .get_arguments()
+                    .any(|argument| argument.get_id() == "process"),
+                "{name} must expose --process for process-private CUDA ordinals"
+            );
+        }
+        Ok(())
     }
 
     #[test]

@@ -6,10 +6,12 @@
 //! surface, package validation, and JSON envelope projection.
 
 use agent_plugin_installer::{
-    AgentPluginError, AgentPluginOperation, AgentRuntime, DoctorStatus, InstallRequest, PluginRef,
-    UninstallRequest, UpdateRequest, check_operation as check_runtime_operation,
-    doctor as doctor_runtime, install as install_runtime, uninstall as uninstall_runtime,
-    update as update_runtime,
+    AgentPluginError, AgentPluginOperation, AgentRuntime, AgentSelector as InstallerAgentSelector,
+    BatchFailure, BatchOperationError, BatchStatus, DoctorStatus, FailurePolicy, InstallRequest,
+    MarketplaceSource, OperationError, PluginRef, SourceUpdateRequest, UninstallRequest,
+    UpdateRequest, check_operation as check_runtime_operation, doctor as doctor_runtime,
+    install as install_runtime, uninstall as uninstall_runtime, update as update_runtime,
+    update_from_source_many,
 };
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use serde::Serialize;
@@ -26,6 +28,7 @@ const VELOQ_PLUGIN: PluginRef<'static> = PluginRef {
     selector: "veloq@veloq",
     name: "veloq",
 };
+const VELOQ_MARKETPLACE_SOURCE: &str = "lucifer1004/veloq";
 const AGENT_VALUES: [&str; 3] = ["codex", "claude", "all"];
 
 #[derive(Debug)]
@@ -106,20 +109,35 @@ pub fn cli() -> Command {
         )
         .subcommand(
             Command::new("install")
-                .about("Install VeloQ Agent Skills into a supported agent runtime")
+                .about(
+                    "Install VeloQ Agent Skills into a supported agent runtime \
+                     (default source: Git marketplace lucifer1004/veloq)",
+                )
                 .arg(agent_arg(true))
                 .arg(
                     Arg::new(FROM_CHECKOUT)
                         .long(FROM_CHECKOUT)
                         .value_name("PATH")
-                        .required(true)
-                        .help("Install from a local VeloQ checkout with plugin package metadata"),
+                        .help(
+                            "Install from a local VeloQ checkout with plugin package metadata; \
+                             omit to install from the Git marketplace lucifer1004/veloq",
+                        ),
                 ),
         )
         .subcommand(
             Command::new("update")
                 .about("Update VeloQ Agent Skills through the selected agent runtime")
-                .arg(agent_arg(true)),
+                .arg(agent_arg(true))
+                .arg(
+                    Arg::new(FROM_CHECKOUT)
+                        .long(FROM_CHECKOUT)
+                        .value_name("PATH")
+                        .help(
+                            "Update from a local VeloQ checkout; omit to update through the \
+                             registered `veloq` Git marketplace (default source: \
+                             lucifer1004/veloq)",
+                        ),
+                ),
         )
         .subcommand(
             Command::new("uninstall")
@@ -185,35 +203,89 @@ fn doctor(matches: &ArgMatches) -> MetaResult<AgentPayload> {
 
 fn install(matches: &ArgMatches) -> MetaResult<AgentPayload> {
     let agents = selected_agents(matches.get_one::<String>(SELECTOR).map(String::as_str));
-    let checkout = matches
-        .get_one::<String>(FROM_CHECKOUT)
-        .map(PathBuf::from)
-        .ok_or_else(|| MetaError::missing_argument(FROM_CHECKOUT))?;
-    for agent in &agents {
-        validate_checkout(*agent, &checkout)?;
+    if let Some(checkout) = matches.get_one::<String>(FROM_CHECKOUT).map(PathBuf::from) {
+        for agent in &agents {
+            validate_checkout(*agent, &checkout)?;
+        }
+        preflight_agents(&agents, AgentPluginOperation::Install)?;
+        let mut rows = Vec::with_capacity(agents.len());
+        for agent in agents {
+            let install_checkout = install_checkout(agent, &checkout)?;
+            let outcome = install_runtime(
+                agent,
+                InstallRequest::local(&install_checkout, VELOQ_PLUGIN),
+            )
+            .map_err(map_operation_error)?;
+            rows.push(success_row(
+                outcome.runtime,
+                "install",
+                AgentStatus::Installed,
+                outcome.commands,
+                Some(&checkout),
+            ));
+        }
+        return Ok(payload(rows));
     }
+
     preflight_agents(&agents, AgentPluginOperation::Install)?;
     let mut rows = Vec::with_capacity(agents.len());
     for agent in agents {
-        let install_checkout = install_checkout(agent, &checkout)?;
         let outcome = install_runtime(
             agent,
-            InstallRequest::local(&install_checkout, VELOQ_PLUGIN),
+            InstallRequest::new(
+                MarketplaceSource::new(VELOQ_MARKETPLACE_SOURCE),
+                VELOQ_PLUGIN,
+            ),
         )
-        .map_err(map_installer_error)?;
-        rows.push(success_row(
+        .map_err(map_operation_error)?;
+        let mut row = success_row(
             outcome.runtime,
             "install",
             AgentStatus::Installed,
             outcome.commands,
-            Some(&checkout),
+            None,
+        );
+        row.message = Some(format!(
+            "installed from Git marketplace {VELOQ_MARKETPLACE_SOURCE}"
         ));
+        rows.push(row);
     }
     Ok(payload(rows))
 }
 
 fn update(matches: &ArgMatches) -> MetaResult<AgentPayload> {
-    let agents = selected_agents(matches.get_one::<String>(SELECTOR).map(String::as_str));
+    let selected = matches.get_one::<String>(SELECTOR).map(String::as_str);
+    let agents = selected_agents(selected);
+    if let Some(checkout) = matches.get_one::<String>(FROM_CHECKOUT).map(PathBuf::from) {
+        for agent in &agents {
+            validate_checkout(*agent, &checkout)?;
+        }
+        let reporting_agent = agents.first().copied().unwrap_or(AgentRuntime::Codex);
+        let source = checkout
+            .canonicalize()
+            .map_err(|_| package_missing(reporting_agent, &checkout, &checkout))?;
+        let report = update_from_source_many(
+            selected_agent_selector(selected),
+            |_| SourceUpdateRequest::local(&source, VELOQ_PLUGIN),
+            FailurePolicy::StopOnFailure,
+        )
+        .map_err(map_batch_installer_error)?;
+        let rows = report
+            .outcomes
+            .into_iter()
+            .map(|outcome| {
+                success_row(
+                    outcome.runtime,
+                    "update",
+                    AgentStatus::Updated,
+                    mutation_commands(outcome.commands),
+                    Some(&checkout),
+                )
+            })
+            .collect();
+        return Ok(payload(rows));
+    }
+
     preflight_agents(&agents, AgentPluginOperation::Update)?;
     let mut rows = Vec::with_capacity(agents.len());
     for agent in agents {
@@ -221,7 +293,7 @@ fn update(matches: &ArgMatches) -> MetaResult<AgentPayload> {
             agent,
             UpdateRequest::new(VELOQ_PLUGIN).with_marketplace_name("veloq"),
         )
-        .map_err(map_installer_error)?;
+        .map_err(map_operation_error)?;
         rows.push(success_row(
             outcome.runtime,
             "update",
@@ -239,7 +311,7 @@ fn uninstall(matches: &ArgMatches) -> MetaResult<AgentPayload> {
     let mut rows = Vec::with_capacity(agents.len());
     for agent in agents {
         let outcome = uninstall_runtime(agent, UninstallRequest::new(VELOQ_PLUGIN))
-            .map_err(map_installer_error)?;
+            .map_err(map_operation_error)?;
         rows.push(success_row(
             outcome.runtime,
             "uninstall",
@@ -279,11 +351,15 @@ fn preflight_agents(agents: &[AgentRuntime], operation: AgentPluginOperation) ->
 }
 
 fn selected_agents(selector: Option<&str>) -> Vec<AgentRuntime> {
+    selected_agent_selector(selector).runtimes().to_vec()
+}
+
+fn selected_agent_selector(selector: Option<&str>) -> InstallerAgentSelector {
     match selector.unwrap_or(ALL) {
-        "codex" => vec![AgentRuntime::Codex],
-        "claude" => vec![AgentRuntime::Claude],
-        ALL => AgentRuntime::supported().to_vec(),
-        _ => Vec::new(),
+        "codex" => InstallerAgentSelector::Codex,
+        "claude" => InstallerAgentSelector::Claude,
+        ALL => InstallerAgentSelector::All,
+        _ => InstallerAgentSelector::All,
     }
 }
 
@@ -376,6 +452,18 @@ fn map_installer_error(err: AgentPluginError) -> MetaError {
             agent: runtime,
             cli,
         },
+        AgentPluginError::CliSpawnFailed {
+            runtime,
+            phase,
+            command,
+            reason,
+        } => MetaError::AgentCliFailed {
+            agent: runtime,
+            phase,
+            command,
+            status: None,
+            stderr: reason,
+        },
         AgentPluginError::CliFailed {
             runtime,
             phase,
@@ -399,6 +487,56 @@ fn map_installer_error(err: AgentPluginError) -> MetaError {
             reason,
         },
     }
+}
+
+fn map_operation_error(err: OperationError) -> MetaError {
+    map_installer_error(err.error)
+}
+
+fn map_batch_installer_error(err: BatchOperationError) -> MetaError {
+    for outcome in err.into_report().outcomes {
+        let Some(failure) = outcome.failure else {
+            continue;
+        };
+        return match failure {
+            BatchFailure::Validation(error) => map_installer_error(error),
+            BatchFailure::Operation(error) => map_installer_error(error.error),
+            BatchFailure::Preflight { .. } if outcome.status == BatchStatus::Missing => {
+                MetaError::AgentCliMissing {
+                    agent: outcome.runtime.id(),
+                    cli: outcome.runtime.cli(),
+                }
+            }
+            BatchFailure::Preflight { message } => MetaError::AgentCliFailed {
+                agent: outcome.runtime.id(),
+                phase: "preflight",
+                command: outcome.commands.join(" && "),
+                status: None,
+                stderr: message,
+            },
+            other => MetaError::AgentCliFailed {
+                agent: outcome.runtime.id(),
+                phase: "update",
+                command: outcome.commands.join(" && "),
+                status: None,
+                stderr: other.to_string(),
+            },
+        };
+    }
+    MetaError::AgentCliFailed {
+        agent: "unknown",
+        phase: "update",
+        command: String::new(),
+        status: None,
+        stderr: "agent plugin batch operation failed without a runtime failure".to_string(),
+    }
+}
+
+fn mutation_commands(commands: Vec<String>) -> Vec<String> {
+    commands
+        .into_iter()
+        .filter(|command| !command.ends_with(" --help"))
+        .collect()
 }
 
 fn success_row(

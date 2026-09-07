@@ -2,6 +2,15 @@ use crate::query_sql::event_scan::stats_event_scan;
 use crate::{EventKind, NsysQueryResult};
 use duckdb::types::Value;
 
+pub(super) struct PerKindSubqueryOptions<'a> {
+    pub(super) abs_window: Option<(i64, i64)>,
+    pub(super) nvtx_scope: crate::nvtx_attribution::NvtxScope,
+    pub(super) collapse_versioned: bool,
+    pub(super) columns: &'a crate::column_map::ColumnMap,
+    pub(super) nvtx_parent_sidecar: Option<&'a std::path::Path>,
+    pub(super) include_nvtx_path: bool,
+}
+
 /// SQL fragment selecting (display_name, short_name, kind, duration) for one event table.
 ///
 /// `display_name` is the leaf identity used by `--group-by demangled`
@@ -21,15 +30,19 @@ use duckdb::types::Value;
 /// here from silently misaligning every kind's bind slots across the
 /// surrounding UNION ALL.
 pub(super) fn per_kind_subquery(
+    trace: &veloq_nsys_data::Trace,
     kind: EventKind,
-    abs_window: Option<(i64, i64)>,
-    nvtx_scope: crate::nvtx_attribution::NvtxScope,
-    collapse_versioned: bool,
-    columns: &crate::column_map::ColumnMap,
-    nvtx_parent_sidecar: Option<&std::path::Path>,
-    include_nvtx_path: bool,
+    options: &PerKindSubqueryOptions<'_>,
 ) -> NsysQueryResult<(String, Vec<Value>)> {
-    let scan = stats_event_scan(kind, abs_window, nvtx_scope, collapse_versioned)?;
+    let scan = stats_event_scan(
+        kind,
+        options.abs_window,
+        options.nvtx_scope,
+        options.collapse_versioned,
+        options.columns,
+    )?;
+    let process =
+        veloq_nsys_data::process_sql_projection(trace, scan.table, "t", "event_proc", "t.start");
 
     // Mangled-name projection: real value for kernels (StringIds
     // probe degrades to NULL on schemas missing the column), display
@@ -37,8 +50,11 @@ pub(super) fn per_kind_subquery(
     // axis doesn't collapse memcpy/sync/runtime/NVTX into a single
     // NULL bucket).
     let (mangled_expr, mangled_join): (String, String) = if matches!(kind, EventKind::Kernel) {
-        let mangled_col =
-            crate::column_map::maybe_col(columns, "CUPTI_ACTIVITY_KIND_KERNEL", "mangledName");
+        let mangled_col = crate::column_map::maybe_col(
+            options.columns,
+            "CUPTI_ACTIVITY_KIND_KERNEL",
+            "mangledName",
+        );
         let join = format!("LEFT JOIN nsight.StringIds s_mng ON s_mng.id = {mangled_col}");
         ("s_mng.value".to_string(), join)
     } else {
@@ -57,8 +73,8 @@ pub(super) fn per_kind_subquery(
         domain_id_expr,
         domain_pid_expr,
         parent_join,
-    ) = match nvtx_parent_sidecar {
-        Some(path) => crate::nvtx_parent::join_clause(kind, path, include_nvtx_path),
+    ) = match options.nvtx_parent_sidecar {
+        Some(path) => crate::nvtx_parent::join_clause(trace, kind, path, options.include_nvtx_path),
         None => (
             "CAST(NULL AS BIGINT)".to_string(),
             "CAST(NULL AS VARCHAR)".to_string(),
@@ -98,6 +114,7 @@ pub(super) fn per_kind_subquery(
                 {short_expr}   AS short_name, \
                 {mangled_expr} AS mangled_name, \
                 '{label}'      AS kind, \
+                {process_expr} AS process_id, \
                 {duration_expr} AS duration, \
                 {dev}        AS device_id, \
                 {ctx}        AS context_id, \
@@ -117,10 +134,12 @@ pub(super) fn per_kind_subquery(
                 {block_x_e}                        AS block_x, \
                 {block_y_e}                        AS block_y, \
                 {block_z_e}                        AS block_z \
-         FROM nsight.{table} t {join_clause} {mangled_join} {parent_join} {where_clause}",
+         FROM nsight.{table} t {join_clause} {mangled_join} {process_join} {parent_join} {where_clause}",
         display_expr = scan.display_expr.as_str(),
         short_expr = scan.short_expr.as_str(),
         label = scan.label,
+        process_expr = process.expr,
+        process_join = process.join,
         duration_expr = scan.duration_expr.as_str(),
         dev = scan.device_expr,
         ctx = scan.context_expr,

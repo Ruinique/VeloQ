@@ -47,6 +47,24 @@ pub enum NsysDataError {
         source: duckdb::Error,
     },
 
+    #[error("query worker pool could not be created")]
+    QueryWorkerPoolBuild {
+        #[source]
+        source: rayon::ThreadPoolBuildError,
+    },
+
+    #[error("duckdb memory limit could not be configured")]
+    DuckdbMemoryConfig {
+        #[source]
+        source: duckdb::Error,
+    },
+
+    #[error("duckdb resident memory could not be read")]
+    DuckdbResidentMemoryRead {
+        #[source]
+        source: duckdb::Error,
+    },
+
     #[error("duckdb in-memory connection could not be opened")]
     DuckdbOpenInMemory {
         #[source]
@@ -235,6 +253,18 @@ pub enum NsysDataError {
         "--stream {stream} requires a single device scope; pass --device <id> or drop --stream"
     )]
     ScopeStreamRequiresDevice { stream: i64 },
+
+    #[error(
+        "CUDA process identity could not be resolved for {table} \
+         (device={device_id}, context={context_id}, correlation={correlation_id:?}); \
+         capture process/runtime metadata or use a complete Nsight Systems export"
+    )]
+    CudaProcessUnresolved {
+        table: String,
+        device_id: i32,
+        context_id: i64,
+        correlation_id: Option<i64>,
+    },
 
     #[error("scope device probe requires {table}.{column}, which is not present in this trace")]
     ScopeDeviceProbeColumnMissing {
@@ -617,6 +647,18 @@ impl NsysDataError {
         Self::DuckdbThreadConfig { source }
     }
 
+    pub fn query_worker_pool_build(source: rayon::ThreadPoolBuildError) -> Self {
+        Self::QueryWorkerPoolBuild { source }
+    }
+
+    pub fn duckdb_memory_config(source: duckdb::Error) -> Self {
+        Self::DuckdbMemoryConfig { source }
+    }
+
+    pub fn duckdb_resident_memory_read(source: duckdb::Error) -> Self {
+        Self::DuckdbResidentMemoryRead { source }
+    }
+
     pub fn duckdb_open_in_memory(source: duckdb::Error) -> Self {
         Self::DuckdbOpenInMemory { source }
     }
@@ -826,6 +868,20 @@ impl NsysDataError {
 
     pub fn scope_stream_requires_device(stream: i64) -> Self {
         Self::ScopeStreamRequiresDevice { stream }
+    }
+
+    pub fn cuda_process_unresolved(
+        table: impl Into<String>,
+        device_id: i32,
+        context_id: i64,
+        correlation_id: Option<i64>,
+    ) -> Self {
+        Self::CudaProcessUnresolved {
+            table: table.into(),
+            device_id,
+            context_id,
+            correlation_id,
+        }
     }
 
     pub fn scope_device_probe_column_missing(
@@ -1512,6 +1568,13 @@ impl VeloqDiagnostic for NsysDataError {
             }
             Self::ParquetdirNotFound { .. } => ErrorCode::new("nsys.data.parquetdir-not-found"),
             Self::DuckdbThreadConfig { .. } => ErrorCode::new("nsys.data.duckdb-thread-config"),
+            Self::QueryWorkerPoolBuild { .. } => {
+                ErrorCode::new("nsys.data.query-worker-pool-build")
+            }
+            Self::DuckdbMemoryConfig { .. } => ErrorCode::new("nsys.data.duckdb-memory-config"),
+            Self::DuckdbResidentMemoryRead { .. } => {
+                ErrorCode::new("nsys.data.duckdb-resident-memory-read")
+            }
             Self::DuckdbOpenInMemory { .. } => ErrorCode::new("nsys.data.duckdb-open-in-memory"),
             Self::DuckdbSchemaCreate { .. } => ErrorCode::new("nsys.data.duckdb-schema-create"),
             Self::ParquetdirRead { .. } => ErrorCode::new("nsys.data.parquetdir-read"),
@@ -1575,6 +1638,9 @@ impl VeloqDiagnostic for NsysDataError {
             }
             Self::ScopeStreamRequiresDevice { .. } => {
                 ErrorCode::new("nsys.data.scope-stream-requires-device")
+            }
+            Self::CudaProcessUnresolved { .. } => {
+                ErrorCode::new("nsys.data.cuda-process-unresolved")
             }
             Self::ScopeDeviceProbeColumnMissing { .. } => {
                 ErrorCode::new("nsys.data.scope-device-probe-column-missing")

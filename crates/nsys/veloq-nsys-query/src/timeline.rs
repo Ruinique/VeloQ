@@ -9,7 +9,7 @@
 //! exceed the bucket width. It answers "how much kernel/copy work was
 //! issued in this window" (timeline plots, saturation trends), not "how
 //! long the device was busy" — for true union busy/idle time use
-//! `concurrency` (per-device union + overlap) or `gaps` (idle bubbles).
+//! `concurrency` (per-process/device union + overlap) or `gaps` (idle bubbles).
 //!
 //! Bucket alignment: aligned to multiples of `interval_ns` from the
 //! window start (or the trace's primary origin if no `--time-range`).
@@ -23,7 +23,9 @@ use crate::query_sql::{
 };
 use crate::{EventKind, KindFilter, NsysQueryError, NsysQueryResult};
 use duckdb::types::Value;
+use rayon::prelude::*;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::Path;
 use veloq_core::{time::TimeWindow, timeline_bucket_key};
 use veloq_nsys_data::Trace;
@@ -38,6 +40,8 @@ pub struct TimelineRequest {
     pub time_window: Option<TimeWindow>,
     /// Optional NVTX-attribution scope (glob against NVTX range name).
     pub nvtx: Option<String>,
+    /// Restrict to one native process owning the CUDA namespace.
+    pub process_id: Option<i64>,
     /// Restrict to one CUDA device (NSys `deviceId`).
     pub device: Option<i32>,
     /// Restrict to one CUDA stream (NSys `streamId`).
@@ -53,6 +57,7 @@ impl Default for TimelineRequest {
             kinds: KindFilter::All,
             time_window: None,
             nvtx: None,
+            process_id: None,
             device: None,
             stream: None,
             limit: 1000,
@@ -159,15 +164,105 @@ pub struct Bucket {
 }
 
 pub fn run<P: AsRef<Path>>(path: P, req: TimelineRequest) -> NsysQueryResult<TimelineResponse> {
+    validate_request(&req)?;
+    let trace = Trace::open(path).map_err(NsysQueryError::trace_open)?;
+    run_after_validation(&trace, req)
+}
+
+pub fn run_with_trace(trace: &Trace, req: TimelineRequest) -> NsysQueryResult<TimelineResponse> {
+    validate_request(&req)?;
+    run_after_validation(trace, req)
+}
+
+pub fn run_with_index(
+    trace: &Trace,
+    index: &crate::resident_intervals::ResidentIntervalIndex,
+    req: TimelineRequest,
+) -> NsysQueryResult<TimelineResponse> {
+    validate_request(&req)?;
+    if req.nvtx.is_some() {
+        return run_after_validation(trace, req);
+    }
+    let abs_window = trace
+        .resolve_window(req.time_window)
+        .map_err(NsysQueryError::time_window_resolve)?;
+    let kind_policy = TimelineKindPolicy::from_gpu_work_definition()?;
+    let kinds = kind_policy.resolve(&req.kinds, None, trace)?;
+    if kinds.is_empty() {
+        return Ok(TimelineResponse {
+            interval_ns: req.interval_ns,
+            count: 0,
+            total_matched: 0,
+            time_window_ns: abs_window,
+            nvtx_scope: None,
+            rows: Vec::new(),
+        });
+    }
+    let anchor = match abs_window {
+        Some((start_ns, _)) => start_ns,
+        None => {
+            trace
+                .read_origins()
+                .map_err(NsysQueryError::data)?
+                .0
+                .primary
+                .start_ns
+        }
+    };
+    let devices = index
+        .selected_devices(req.process_id, req.device)
+        .collect::<Vec<_>>();
+    let pool = trace
+        .build_query_worker_pool()
+        .map_err(NsysQueryError::data)?;
+    let partials = pool.install(|| {
+        devices
+            .par_iter()
+            .map(|device| {
+                timeline_partition(
+                    device,
+                    &kinds,
+                    req.stream,
+                    abs_window,
+                    anchor,
+                    req.interval_ns,
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut buckets = BTreeMap::<i64, BucketAccumulator>::new();
+    for partial in partials {
+        for (start_ns, contribution) in partial {
+            buckets.entry(start_ns).or_default().merge(contribution);
+        }
+    }
+    let total_matched = i64::try_from(buckets.len()).unwrap_or(i64::MAX);
+    let rows = buckets
+        .into_iter()
+        .take(req.limit)
+        .map(|(start_ns, bucket)| bucket.into_row(start_ns, req.interval_ns))
+        .collect::<Vec<_>>();
+    Ok(TimelineResponse {
+        interval_ns: req.interval_ns,
+        count: rows.len(),
+        total_matched,
+        time_window_ns: abs_window,
+        nvtx_scope: None,
+        rows,
+    })
+}
+
+fn validate_request(req: &TimelineRequest) -> NsysQueryResult<()> {
     crate::check_limit(req.limit)?;
     if req.interval_ns <= 0 {
         return Err(NsysQueryError::TimelineIntervalTooSmall {
             interval_ns: req.interval_ns,
         });
     }
+    Ok(())
+}
 
-    let trace = Trace::open(path).map_err(NsysQueryError::trace_open)?;
-
+fn run_after_validation(trace: &Trace, req: TimelineRequest) -> NsysQueryResult<TimelineResponse> {
     let abs_window = trace
         .resolve_window(req.time_window)
         .map_err(NsysQueryError::time_window_resolve)?;
@@ -179,7 +274,7 @@ pub fn run<P: AsRef<Path>>(path: P, req: TimelineRequest) -> NsysQueryResult<Tim
     // implicitly to the attributable set, and missing tables drop
     // out silently.
     let kind_policy = TimelineKindPolicy::from_gpu_work_definition()?;
-    let kinds = kind_policy.resolve(&req.kinds, req.nvtx.as_deref(), &trace)?;
+    let kinds = kind_policy.resolve(&req.kinds, req.nvtx.as_deref(), trace)?;
     if kinds.is_empty() {
         return Ok(TimelineResponse {
             interval_ns: req.interval_ns,
@@ -207,7 +302,7 @@ pub fn run<P: AsRef<Path>>(path: P, req: TimelineRequest) -> NsysQueryResult<Tim
     };
 
     let attribution = match req.nvtx.as_deref() {
-        Some(p) => Some(crate::nvtx_attribution::build(p, &kinds, &trace)?),
+        Some(p) => Some(crate::nvtx_attribution::build(p, &kinds, trace)?),
         None => None,
     };
     let nvtx_scope = if attribution.is_some() {
@@ -216,16 +311,15 @@ pub fn run<P: AsRef<Path>>(path: P, req: TimelineRequest) -> NsysQueryResult<Tim
         crate::nvtx_attribution::NvtxScope::None
     };
 
-    // Per-kind event SELECTs feeding the UNION ALL.
     let mut subqueries: Vec<String> = Vec::with_capacity(kinds.len());
     let mut per_kind_params: Vec<Value> = Vec::new();
     for kind in &kinds {
         let fragment = per_kind_select(
+            trace,
             *kind,
+            &req,
             abs_window,
             nvtx_scope,
-            req.device,
-            req.stream,
             kind_policy.allowed(),
         )?;
         subqueries.push(fragment.sql);
@@ -320,7 +414,7 @@ pub fn run<P: AsRef<Path>>(path: P, req: TimelineRequest) -> NsysQueryResult<Tim
     params.extend(per_kind_params);
     params.push(Value::BigInt(req.limit as i64));
 
-    let (buckets, total_matched) = hydrate_timeline_rows(&trace, &sql, &params)?;
+    let (buckets, total_matched) = hydrate_timeline_rows(trace, &sql, &params)?;
 
     Ok(TimelineResponse {
         interval_ns: req.interval_ns,
@@ -386,11 +480,11 @@ fn timeline_sql_row(row: &duckdb::Row<'_>) -> Result<TimelineSqlRow, duckdb::Err
 /// are clipped before bucket generation, so buckets and `total_ns`
 /// reflect in-window work only.
 fn per_kind_select(
+    trace: &Trace,
     kind: EventKind,
+    req: &TimelineRequest,
     abs_window: Option<(i64, i64)>,
     nvtx_scope: crate::nvtx_attribution::NvtxScope,
-    device: Option<i32>,
-    stream: Option<i64>,
     allowed_kinds: &[EventKind],
 ) -> NsysQueryResult<SqlFragment> {
     if matches!(kind, EventKind::Runtime | EventKind::Osrt | EventKind::Nvtx) {
@@ -410,12 +504,12 @@ fn per_kind_select(
         None => ("t.start".to_string(), r#"t."end""#.to_string(), Vec::new()),
     };
 
-    let filter = event_scan_filter(
+    let mut filter = event_scan_filter(
         sem,
         EventScanFilterOptions {
             abs_window,
-            device,
-            stream,
+            device: req.device,
+            stream: req.stream,
             nvtx_scope,
             nvtx_policy: NvtxFilterPolicy::ErrorUnlessKindIn {
                 verb: "timeline",
@@ -424,16 +518,131 @@ fn per_kind_select(
         },
         &[],
     )?;
+    let process =
+        veloq_nsys_data::process_sql_projection(trace, sem.table(), "t", "event_proc", "t.start");
+    if let Some(process_id) = req.process_id {
+        filter.push_predicate(format!("{} = ?", process.expr));
+        filter.push_param(Value::BigInt(process_id));
+    }
     let where_clause = filter.where_clause();
     params.extend(filter.into_params());
 
     let sql = format!(
         "SELECT '{label}' AS kind, {start_expr} AS start_ns, {end_expr} AS end_ns \
-         FROM nsight.{table} t {where_clause}",
+         FROM nsight.{table} t {process_join} {where_clause}",
         label = sem.label(),
         table = sem.table(),
+        process_join = process.join,
     );
     Ok(SqlFragment::new(sql, params))
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BucketAccumulator {
+    total_ns: i64,
+    kernel_ns: i64,
+    memcpy_ns: i64,
+    memset_ns: i64,
+    graph_ns: i64,
+    count: i64,
+    kernel_count: i64,
+    memcpy_count: i64,
+    memset_count: i64,
+    graph_count: i64,
+}
+
+impl BucketAccumulator {
+    fn push(&mut self, kind: EventKind, duration_ns: i64) {
+        self.total_ns += duration_ns;
+        self.count += 1;
+        match kind {
+            EventKind::Kernel => {
+                self.kernel_ns += duration_ns;
+                self.kernel_count += 1;
+            }
+            EventKind::Memcpy => {
+                self.memcpy_ns += duration_ns;
+                self.memcpy_count += 1;
+            }
+            EventKind::Memset => {
+                self.memset_ns += duration_ns;
+                self.memset_count += 1;
+            }
+            EventKind::Graph => {
+                self.graph_ns += duration_ns;
+                self.graph_count += 1;
+            }
+            _ => {}
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.total_ns += other.total_ns;
+        self.kernel_ns += other.kernel_ns;
+        self.memcpy_ns += other.memcpy_ns;
+        self.memset_ns += other.memset_ns;
+        self.graph_ns += other.graph_ns;
+        self.count += other.count;
+        self.kernel_count += other.kernel_count;
+        self.memcpy_count += other.memcpy_count;
+        self.memset_count += other.memset_count;
+        self.graph_count += other.graph_count;
+    }
+
+    fn into_row(self, start_ns: i64, interval_ns: i64) -> Bucket {
+        let end_ns = start_ns.saturating_add(interval_ns);
+        Bucket {
+            key: timeline_bucket_key(start_ns, end_ns),
+            start_ns,
+            end_ns,
+            total_ns: self.total_ns,
+            kernel_ns: self.kernel_ns,
+            memcpy_ns: self.memcpy_ns,
+            memset_ns: self.memset_ns,
+            graph_ns: self.graph_ns,
+            count: self.count,
+            kernel_count: self.kernel_count,
+            memcpy_count: self.memcpy_count,
+            memset_count: self.memset_count,
+            graph_count: self.graph_count,
+        }
+    }
+}
+
+fn timeline_partition(
+    device: &crate::resident_intervals::DevicePartition,
+    kinds: &[EventKind],
+    stream_id: Option<i64>,
+    window: Option<(i64, i64)>,
+    anchor_ns: i64,
+    interval_ns: i64,
+) -> BTreeMap<i64, BucketAccumulator> {
+    let mut buckets = BTreeMap::<i64, BucketAccumulator>::new();
+    for interval in device.intervals(window) {
+        if !kinds.contains(&interval.kind)
+            || stream_id.is_some_and(|stream_id| interval.stream_id != stream_id)
+        {
+            continue;
+        }
+        let offset = interval.start_ns.saturating_sub(anchor_ns);
+        let mut bucket_start =
+            offset.div_euclid(interval_ns).saturating_mul(interval_ns) + anchor_ns;
+        while bucket_start < interval.end_ns {
+            let bucket_end = bucket_start.saturating_add(interval_ns);
+            let duration_ns = interval.end_ns.min(bucket_end) - interval.start_ns.max(bucket_start);
+            if duration_ns > 0 {
+                buckets
+                    .entry(bucket_start)
+                    .or_default()
+                    .push(interval.kind, duration_ns);
+            }
+            let Some(next_bucket) = bucket_start.checked_add(interval_ns) else {
+                break;
+            };
+            bucket_start = next_bucket;
+        }
+    }
+    buckets
 }
 
 #[cfg(test)]
@@ -509,12 +718,14 @@ mod tests {
             EventKind::Memset,
             EventKind::Graph,
         ];
+        let (_dir, trace) = minimal_trace()?;
+        let req = TimelineRequest::default();
         let fragment = per_kind_select(
+            &trace,
             EventKind::Kernel,
+            &req,
             Some((10, 20)),
             crate::nvtx_attribution::NvtxScope::None,
-            None,
-            None,
             &allowed,
         )?;
         assert_eq!(

@@ -27,6 +27,7 @@
 //! Run: `VELOQ_NCU_LIVE=1 cargo test --release -p veloq-ncu --test ncu_live_drift`
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -47,15 +48,14 @@ fn helper_path() -> PathBuf {
 /// but always re-exports (the cache fast-path would serve the committed
 /// sidecar without touching `ncu_report`).
 fn run_helper_live(report: &Path) -> Result<NativeSidecar> {
-    let pythonpath = cache::locate_ncu_report()
-        .context("locate ncu_report (VELOQ_NCU_LIVE set but Nsight Compute not found)")?;
+    let pythonpath = cache::locate_ncu_report().context("resolve ncu_report import path")?;
     let python = std::env::var("VELOQ_PYTHON").unwrap_or_else(|_| "python3".to_string());
-    let out = Command::new(&python)
-        .arg(helper_path())
-        .arg(report)
-        .env("PYTHONPATH", &pythonpath)
-        .output()
-        .context("spawn export helper")?;
+    let mut command = Command::new(&python);
+    command.arg(helper_path()).arg(report);
+    if let Some(path) = pythonpath {
+        command.env("VELOQ_NCU_REPORT_DIR", path);
+    }
+    let out = command.output().context("spawn export helper")?;
     if !out.status.success() {
         bail!(
             "export helper failed ({}):\n{}",
@@ -130,5 +130,36 @@ fn live_helper_sidecar_matches_committed() -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+#[test]
+fn live_helper_compressed_sidecar_matches_plain() -> Result<()> {
+    if std::env::var_os("VELOQ_NCU_LIVE").is_none() {
+        eprintln!(
+            "skipping: set VELOQ_NCU_LIVE=1 on a box with Nsight Compute to run the drift check"
+        );
+        return Ok(());
+    }
+
+    let report = report_path();
+    let plain = run_helper_live(&report)?;
+    let raw = fs::read(&report).context("read plain NCU report")?;
+    let compressed =
+        zstd::stream::encode_all(raw.as_slice(), 0).context("compress NCU report fixture")?;
+    let compressed_path = std::env::temp_dir().join(format!(
+        "veloq-ncu-live-{}-compressed.ncu-repz",
+        std::process::id()
+    ));
+    fs::write(&compressed_path, compressed).context("write compressed NCU report fixture")?;
+    let loaded = run_helper_live(&compressed_path);
+    let _ = fs::remove_file(&compressed_path);
+    let loaded = loaded?;
+
+    assert_eq!(
+        serde_json::to_value(loaded)?,
+        serde_json::to_value(plain)?,
+        "compressed and plain reports must produce the same native sidecar"
+    );
     Ok(())
 }

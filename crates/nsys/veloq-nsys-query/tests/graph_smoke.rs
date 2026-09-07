@@ -483,6 +483,18 @@ fn graph_replays_node_mode_groups_by_correlation_and_orders_top_nodes() -> Resul
     assert_eq!(first.busy_ns, 15_000_000);
     assert_eq!(first.idle_inside_replay_ns, 500_000);
     assert!(first.decomposition_available);
+    assert!(r.rows.iter().all(|row| {
+        row.launcher_row_id
+            .is_some_and(|id| id.kind == EventKind::Runtime)
+    }));
+    assert_eq!(
+        r.rows
+            .iter()
+            .filter_map(|row| row.launcher_row_id.map(|id| id.rowid))
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        3
+    );
     assert_eq!(first.top_nodes.len(), 2);
     let first_node = first
         .top_nodes
@@ -534,6 +546,104 @@ fn graph_replays_same_raw_correlation_on_two_devices_does_not_merge() -> Result<
         .ok_or_else(|| anyhow::anyhow!("expected second replay"))?;
     assert_ne!(first.synthetic_id, second.synthetic_id);
     assert_eq!(first.correlation_id, second.correlation_id);
+    Ok(())
+}
+
+#[test]
+fn resident_graph_trace_index_preserves_varying_query_responses() -> Result<()> {
+    let fixture = fixture::with_graph_trace()?;
+    let trace = veloq_nsys_data::Trace::open(fixture.path())?;
+    let mut requests = vec![
+        veloq_nsys_query::graph_replays::GraphReplaysRequest::default(),
+        veloq_nsys_query::graph_replays::GraphReplaysRequest {
+            time_window: Some(TimeWindow::parse("@125ms-@126ms")?),
+            sort: Some(veloq_core::SortSpec::parse("start:asc")?),
+            limit: 1,
+            ..Default::default()
+        },
+        veloq_nsys_query::graph_replays::GraphReplaysRequest {
+            nvtx: Some("frame".to_string()),
+            top_nodes_limit: 1,
+            ..Default::default()
+        },
+    ];
+    for sort in ["wall:asc", "sum:desc", "start:desc", "count:asc"] {
+        requests.push(veloq_nsys_query::graph_replays::GraphReplaysRequest {
+            process_id: Some(12345),
+            device: Some(0),
+            sort: Some(veloq_core::SortSpec::parse(sort)?),
+            ..Default::default()
+        });
+    }
+    for request in requests {
+        let one_shot = veloq_nsys_query::graph_replays::run(fixture.path(), request.clone())?;
+        assert!(veloq_nsys_query::graph_replays::ensure_resident_index(
+            &trace
+        )?);
+        let resident = veloq_nsys_query::graph_replays::run_with_trace(&trace, request)?;
+        assert_eq!(
+            serde_json::to_vec(&resident)?,
+            serde_json::to_vec(&one_shot)?
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn resident_graph_node_index_preserves_varying_query_responses() -> Result<()> {
+    let fixture = fixture::with_graph_nodes()?;
+    let trace = veloq_nsys_data::Trace::open(fixture.path())?;
+    let mut requests = vec![
+        veloq_nsys_query::graph_replays::GraphReplaysRequest::default(),
+        veloq_nsys_query::graph_replays::GraphReplaysRequest {
+            time_window: Some(TimeWindow::parse("@200ms-@216ms")?),
+            sort: Some(veloq_core::SortSpec::parse("sum:desc,start:asc")?),
+            limit: 2,
+            top_nodes_limit: 1,
+            ..Default::default()
+        },
+        veloq_nsys_query::graph_replays::GraphReplaysRequest {
+            nvtx: Some("frame".to_string()),
+            ..Default::default()
+        },
+    ];
+    for sort in ["wall:asc", "sum:desc", "start:desc", "count:asc"] {
+        requests.push(veloq_nsys_query::graph_replays::GraphReplaysRequest {
+            process_id: Some(12345),
+            device: Some(0),
+            sort: Some(veloq_core::SortSpec::parse(sort)?),
+            top_nodes_limit: 2,
+            ..Default::default()
+        });
+    }
+    for request in requests {
+        let one_shot = veloq_nsys_query::graph_replays::run(fixture.path(), request.clone())?;
+        assert!(veloq_nsys_query::graph_replays::ensure_resident_index(
+            &trace
+        )?);
+        let resident = veloq_nsys_query::graph_replays::run_with_trace(&trace, request)?;
+        assert_eq!(
+            serde_json::to_vec(&resident)?,
+            serde_json::to_vec(&one_shot)?
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn resident_graph_index_absence_preserves_established_empty_response() -> Result<()> {
+    let fixture = fixture::minimal_gpu()?;
+    let trace = veloq_nsys_data::Trace::open(fixture.path())?;
+    let request = veloq_nsys_query::graph_replays::GraphReplaysRequest::default();
+    let one_shot = veloq_nsys_query::graph_replays::run(fixture.path(), request.clone())?;
+    assert!(!veloq_nsys_query::graph_replays::ensure_resident_index(
+        &trace
+    )?);
+    let resident = veloq_nsys_query::graph_replays::run_with_trace(&trace, request)?;
+    assert_eq!(
+        serde_json::to_vec(&resident)?,
+        serde_json::to_vec(&one_shot)?
+    );
     Ok(())
 }
 
@@ -754,6 +864,95 @@ fn inspect_overhead_returns_details_with_label() -> Result<()> {
             assert_eq!(o.duration_ns, 100_000);
         }
         other => anyhow::bail!("expected EventDetails::Overhead, got {other:?}"),
+    }
+    Ok(())
+}
+
+// ===== Node-mode without graph columns (Nsight 2025.3) ======================
+//
+// Real Nsight 2025.3 `--cuda-graph-trace=node` exports may omit the
+// `graphId` / `graphNodeId` columns from the kernel/memcpy/memset
+// tables entirely (NODE_EVENTS is still present). These tests pin the
+// degrade-to-NULL behaviour: verbs succeed, graph attribution is NULL,
+// and graph-replays reports no node-mode replays rather than failing.
+
+#[test]
+fn stats_tolerates_kernel_table_without_graph_columns() -> Result<()> {
+    let trace = fixture::with_graph_nodes_missing_graph_columns()?;
+    let req = veloq_nsys_query::stats::StatsRequest {
+        kinds: KindFilter::Only(vec![EventKind::Kernel]),
+        group_by: veloq_nsys_query::stats::GroupBy::from_arg("no-name,graph")?,
+        ..Default::default()
+    };
+    let r = veloq_nsys_query::stats::run(trace.path(), req)?;
+    // Both kernels land in the single graph_id=NULL bucket.
+    assert_eq!(r.total_matched, 1);
+    let row = r
+        .rows
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("expected one stats row"))?;
+    assert_eq!(row.count, 2);
+    assert_eq!(row.total_ns, 15_000_000, "5ms + 10ms");
+    assert!(row.graph_id.is_none(), "graph column absent → NULL");
+    assert!(row.graph_node_id.is_none(), "graph column absent → NULL");
+    Ok(())
+}
+
+#[test]
+fn search_tolerates_kernel_table_without_graph_columns() -> Result<()> {
+    let trace = fixture::with_graph_nodes_missing_graph_columns()?;
+    let req = veloq_nsys_query::search::SearchRequest {
+        kinds: KindFilter::Only(vec![EventKind::Kernel]),
+        limit: 10,
+        ..Default::default()
+    };
+    let r = veloq_nsys_query::search::run(trace.path(), req)?;
+    assert_eq!(r.rows.len(), 2);
+    for h in &r.rows {
+        let b = h.base();
+        assert_eq!(b.row_id.kind, EventKind::Kernel);
+        assert_eq!(b.name, "graph_inner_kernel");
+    }
+    Ok(())
+}
+
+#[test]
+fn graph_replays_reports_no_node_replays_without_graph_columns() -> Result<()> {
+    let trace = fixture::with_graph_nodes_missing_graph_columns()?;
+    let r = veloq_nsys_query::graph_replays::run(
+        trace.path(),
+        veloq_nsys_query::graph_replays::GraphReplaysRequest::default(),
+    )?;
+    // No graphNodeId column → the node-event scan yields zero rows, so
+    // the trace has no replay evidence to report (not an error).
+    assert_eq!(r.capture_mode.to_string(), "none");
+    assert_eq!(r.total_matched, 0);
+    assert!(r.rows.is_empty());
+    Ok(())
+}
+
+#[test]
+fn inspect_graph_node_tolerates_kernel_table_without_graph_columns() -> Result<()> {
+    let trace = fixture::with_graph_nodes_missing_graph_columns()?;
+    // NODE_EVENTS rowid 1 (graphNodeId 1001). The kernel table has no
+    // graphId/graphNodeId columns, so the enrichment join key is gone:
+    // graph_id / graph_exec_id must degrade to None, not a SQL error.
+    let id = RowId::new(EventKind::GraphNode, 1);
+    let r = veloq_nsys_query::inspect::run(trace.path(), &[id])?;
+    let first = r
+        .rows
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("expected one event"))?;
+    match first {
+        veloq_nsys_query::inspect::EventDetails::GraphNode(n) => {
+            assert_eq!(n.graph_node_id, 1001);
+            assert!(n.graph_id.is_none(), "no kernel graphId column → None");
+            assert!(
+                n.graph_exec_id.is_none(),
+                "graph_exec_id chains off graph_id → None"
+            );
+        }
+        other => anyhow::bail!("expected EventDetails::GraphNode, got {other:?}"),
     }
     Ok(())
 }

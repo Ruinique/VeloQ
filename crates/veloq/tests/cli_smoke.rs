@@ -32,12 +32,16 @@ mod ncu;
 mod nsys_artifacts;
 #[path = "cli_smoke/nsys_errors.rs"]
 mod nsys_errors;
+#[path = "cli_smoke/nsys_host_only.rs"]
+mod nsys_host_only;
 #[path = "cli_smoke/nsys_ncu_command.rs"]
 mod nsys_ncu_command;
 #[path = "cli_smoke/pytorch.rs"]
 mod pytorch;
 #[path = "cli_smoke/root.rs"]
 mod root;
+#[path = "cli_smoke/shared_execution.rs"]
+mod shared_execution;
 
 /// COPY every user-created table in the in-memory DuckDB connection
 /// out to `<dir>/test_pqtdir/<TABLE>.parquet` and return the
@@ -218,6 +222,9 @@ fn build_minimal_trace() -> Result<(TempDir, PathBuf)> {
         r#"
         CREATE TABLE StringIds (id BIGINT PRIMARY KEY, value TEXT);
         CREATE TABLE META_DATA_EXPORT (name TEXT, value TEXT);
+        CREATE TABLE TARGET_INFO_CUDA_CONTEXT_INFO (
+            deviceId BIGINT, contextId BIGINT, processId BIGINT
+        );
         CREATE TABLE CUPTI_ACTIVITY_KIND_KERNEL (
             start BIGINT, "end" BIGINT,
             deviceId BIGINT, contextId BIGINT, streamId BIGINT,
@@ -238,6 +245,11 @@ fn build_minimal_trace() -> Result<(TempDir, PathBuf)> {
     conn.execute(
         "INSERT INTO StringIds (id, value) VALUES (?, ?)",
         params![1i64, "smoke_kernel"],
+    )?;
+    conn.execute(
+        "INSERT INTO TARGET_INFO_CUDA_CONTEXT_INFO \
+         (deviceId, contextId, processId) VALUES (?, ?, ?)",
+        params![0i32, 0i64, 12345i64],
     )?;
     conn.execute(
         "INSERT INTO META_DATA_EXPORT (name, value) VALUES (?, ?), (?, ?), (?, ?)",

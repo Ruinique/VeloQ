@@ -7,6 +7,174 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Keep the fork's `veloq bank` verbs (`explain`, `trace`, `compare`,
+  `search`) alongside upstream 0.6.3 daemon and NSys process-scoped
+  identities after the reverse-sync merge.
+
+## [0.6.3] - 2026-08-21
+
+### Fixed
+
+- **self-update for `cargo install` builds** — map glibc Linux build targets
+  (`*-unknown-linux-gnu`) to the shipped musl release archives, so
+  cargo-installed binaries can self-update instead of failing with
+  `meta.self-update.binary-install` (WI-2026-08-21-001). Affected users must
+  update once by hand (`cargo install veloq --force` or the release binary);
+  self-update works normally from 0.6.3 onward.
+- **Kernel tables without graph columns** — tolerate
+  `CUPTI_ACTIVITY_KIND_KERNEL` exports that lack `graphId`/`graphNodeId`
+  (seen on Nsight 2025.3 node-mode captures) in `stats`, `search`,
+  `graph-replays`, and `inspect graph_node`, reporting NULL graph
+  attribution instead of hard errors (WI-2026-08-21-002).
+
+## [0.6.2] - 2026-08-20
+
+### Added
+
+- **Checkout-free agent plugin install** — `veloq agent install <agent>` now
+  defaults to the Git marketplace `lucifer1004/veloq`, so binary-only users
+  can install VeloQ Agent Skills without a source checkout;
+  `--from-checkout` remains the validated local path, unchanged
+  (WI-2026-08-20-001).
+
+### Changed
+
+- **Slimmed `nsys-profile-analysis` skill for strong models** — SKILL.md
+  289 → 113 lines, value-proposition-first with answer-changing pitfalls
+  promoted to first-class (incl. two bench-discovered traps: GRAPH_TRACE
+  presence ≠ coverage, and globalTid TID extraction); command detail defers
+  to `--help` / `veloq schema` / `veloq recipes`; references consolidated
+  from five files to three (`pitfalls.md`, `capabilities.md`,
+  `inspect-shapes.md`).
+
+## [0.6.1] - 2026-08-04
+
+### Fixed
+
+- **Active NCU installation discovery** — resolve a PATH-selected `ncu`
+  symlink before locating its bundled `extras/python/ncu_report.py`, so
+  package environments use their matching Nsight Compute installation before
+  unrelated platform-wide installs.
+- **NSys host-only queryability** — accept canonical NVTX-only schema 3.x
+  exports and keep implicit single-device resolution from becoming an invalid
+  device filter for explicit NVTX, CUDA runtime, and OS runtime queries.
+
+## [0.6.0] - 2026-07-30
+
+### Added
+
+- **Official PyPI NCU reader support** — use an `ncu_report` module already
+  importable by the selected Python interpreter, including NVIDIA's
+  `ncu-report` package, before falling back to full Nsight Compute
+  installation discovery.
+- **Explicit PyTorch Chrome trace filenames** — accept `.json` and
+  `.json.gz` inputs under `veloq pytorch` while keeping automatic source
+  detection restricted to `.pt.trace.json` and `.pt.trace.json.gz`.
+- **Compressed NCU reports** — recognize and query zstd-compressed
+  `.ncu-repz` reports alongside `.ncu-rep`, including cubin-backed
+  disassembly and an explicit diagnostic for report readers that predate
+  compressed-report support.
+- **Optional local query daemon** — add manual `veloq daemon
+  start/status/stop` lifecycle commands and `--daemon auto|off|required`
+  routing over current-user-only local IPC. Resident sessions, exact rendered
+  responses, admission, cancellation, idle expiry, freshness invalidation, and
+  result-first/cost-aware session eviction are bounded by explicit daemon
+  resource settings.
+- **Daemon-resident NSys interval index** — after a second changing scan miss,
+  eligible NSys sessions build one disposable, process-partitioned index over
+  the existing fresh `gpu-work-events` sidecar. Start frontiers, compact gap
+  references, and activity summaries accelerate varying `timeline`,
+  `concurrency`, and `gaps` requests while one-off, stale, missing,
+  over-capacity, or ineligible inputs retain the established path.
+- **Daemon-resident NSys graph replay reuse** — graph replay sessions
+  materialize process-qualified summaries, launchers, busy-time decomposition,
+  and ranked node aggregates once. Changing windows, sorting, limits, and NVTX
+  scopes reuse session-local evidence without creating persistent artifacts.
+- **Daemon benchmark gate** — extend the leak-safe local benchmark to separate
+  one-shot execution, resident construction, varying-argument cache misses,
+  exact-response hits, and optional session-eviction rebuilds while reporting
+  retained-memory and cache counters.
+
+### Changed
+
+- **Source execution boundary** — render source-owned JSON, CSV, table, and
+  contextual errors into transport-neutral buffers so one-shot and daemon
+  execution share the same typed dispatch and byte-for-byte output contract.
+- **Daemon private framing** — replace newline-delimited JSON frames with a
+  version-coupled, length-prefixed binary protocol. Bounded stdout and stderr
+  chunks retain their native bytes instead of expanding each byte into a JSON
+  number.
+- **Daemon default resource budgets** — default to one active query, use the
+  shared host-aware query-worker cap, and derive the resident-memory ceiling
+  from the effective host or cgroup memory capacity. A single active query
+  retains its source engine's machine-aware memory default; an explicit query
+  memory ceiling remains available and is required when enabling concurrency.
+- **Reuse-aware exact response admission** — exact responses that fit unused
+  resident capacity remain immediately reusable. A first successful result
+  that would require pressure eviction retains only small, accounted key
+  evidence; the same exact query must succeed again before it may displace
+  colder results or idle sessions under the existing eviction order.
+
+### Fixed
+
+- **Daemon launch lifecycle** — detach the service process from the invoking
+  terminal process group so a successful `daemon start` remains live after
+  its launcher exits.
+- **Daemon execution correctness** — apply bounded admission even without
+  reusable session identity, interrupt active NSys DuckDB work on shutdown,
+  serialize work within each resident session, and close rather than relabel a
+  session when post-query freshness changes.
+- **Daemon transport and caching** — stream buffered output through bounded
+  private-protocol chunks, preserve known source failures as completed CLI
+  outcomes, cache only successful responses, and account retained exact keys
+  and payloads.
+- **Daemon raw output routing** — enable resident routing for NSys
+  `ncu-command`, including byte-identical `--print` stdout and pipe-safe
+  handled errors on stderr.
+
+## [0.5.1] - 2026-07-28
+
+### Added
+
+- **Local agent plugin updates** — `veloq agent update` accepts
+  `--from-checkout <path>` to re-register a durable local marketplace source
+  before refreshing the selected Codex or Claude plugin.
+
+### Fixed
+
+- **Agent plugin lifecycle targeting** — upgrade `agent-plugin-installer` to
+  use qualified `veloq@veloq` identities for Claude update and uninstall while
+  preserving the existing named Git-marketplace update behavior when no local
+  checkout is supplied.
+
+## [0.5.0] - 2026-07-28
+
+### Changed
+
+- **NSys source wire version v4** — make CUDA identity process-aware.
+  Process-sensitive rows now carry `process_id`; device, stream, context,
+  graph replay, slice, gap, concurrency, and visualization keys include a
+  `pid:` axis where required. `--process <PID> --device <ID>` precisely
+  selects a rank-private CUDA device when logical ordinals collide.
+- **NSys trace-map device inventory** — report physical GPU ids from
+  `TARGET_INFO_GPU.id` separately from process-local
+  `(process_id, device_id)` CUDA scopes.
+
+### Fixed
+
+- **Cross-process CUDA identity collisions** — stop merging ranks that reuse
+  the same private `(device, context, stream, correlationId)` values in CUDA
+  graph replay, correlate, NVTX attribution, gaps, concurrency, slices,
+  statistics, and static timeline tracks.
+- **Exact-scope recovery** — ambiguity diagnostics and scoped follow-up
+  commands now preserve both native PID and logical device ordinal instead
+  of suggesting another ambiguous bare `--device`.
+- **Partial-trace scope discovery** — when CUDA context metadata is absent,
+  recover process/device scopes from activity `globalPid` while retaining
+  inactive ordinals from the target GPU inventory.
+
 ## [0.4.1] - 2026-06-19
 
 ### Added
@@ -197,7 +365,8 @@ Initial public release.
   `nsys-profile-analysis` and `ncu-profile-analysis` Agent Skills; a
   one-plugin marketplace listing ships under `.claude-plugin/`.
 
-[Unreleased]: https://github.com/lucifer1004/veloq/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/lucifer1004/veloq/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/lucifer1004/veloq/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/lucifer1004/veloq/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/lucifer1004/veloq/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/lucifer1004/veloq/compare/v0.2.2...v0.3.0

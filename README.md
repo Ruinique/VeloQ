@@ -112,20 +112,37 @@ non-default root such as `.claude/skills/`.
 veloq self-update --no-binary --skills-dir .claude
 ```
 
-### Agent plugin integrations (checkout)
+### Agent plugin integrations
 
-From a VeloQ checkout, the `agent` meta command can install VeloQ-backed
-Agent Skills through each runtime's native plugin CLI:
+The `agent` meta command installs VeloQ-backed Agent Skills through each
+runtime's native plugin CLI. Without `--from-checkout`, it registers the Git
+marketplace `lucifer1004/veloq` (whose marketplace name is `veloq`) and
+installs `veloq@veloq` from it:
 
 ```bash
 veloq agent doctor
-veloq agent install codex --from-checkout .
-veloq agent install claude --from-checkout .
+veloq agent install codex
+veloq agent install claude
 veloq agent update codex
 veloq agent update claude
 veloq agent uninstall codex
 veloq agent uninstall claude
 ```
+
+From a VeloQ checkout, pass `--from-checkout` to install or update from the
+local plugin package instead:
+
+```bash
+veloq agent install codex --from-checkout .
+veloq agent install claude --from-checkout .
+veloq agent update codex --from-checkout .
+veloq agent update claude --from-checkout .
+```
+
+Local marketplace paths are persistent runtime configuration. Keep the
+checkout available after installation and pass it again to `agent update`.
+Omitting `--from-checkout` preserves the named Git-marketplace update path for
+installations registered from Git.
 
 The plugin installs handle Agent Skills only. Those skills require the
 VeloQ CLI for evidence extraction, so install the `veloq` binary separately
@@ -140,6 +157,7 @@ command wraps the native equivalent:
 ```bash
 codex plugin marketplace add .
 codex plugin add veloq@veloq
+# Repeat both commands to refresh a local-checkout installation.
 codex plugin remove veloq@veloq
 ```
 
@@ -160,7 +178,10 @@ native equivalent:
 ```bash
 claude plugin marketplace add ./
 claude plugin install veloq@veloq
-claude plugin uninstall veloq
+# For a local-checkout refresh:
+claude plugin marketplace add ./
+claude plugin update veloq@veloq
+claude plugin uninstall veloq@veloq
 ```
 
 This uses the same Agent Skills through the Claude-specific plugin metadata;
@@ -222,6 +243,10 @@ veloq search path/to/trace.nsys-rep --type kernel --name-regex 'gemm' --sort dur
 # Dense events are aggregated into per-track density bins by default.
 veloq viz timeline path/to/trace.nsys-rep --from @100000000 --to @120000000
 
+# Select one process-private logical GPU exactly in a figure.
+veloq viz timeline path/to/trace.nsys-rep --from @100000000 --to @120000000 \
+  --track gpu:process=12345,device=0
+
 # Highlight the top kernel names in that window while preserving the
 # base event-type legend; metadata lands in data.auxiliary.resolved_highlights.
 veloq viz timeline path/to/trace.nsys-rep --from @100000000 --to @120000000 --highlight-kernels top=3,scope=name
@@ -263,7 +288,7 @@ veloq inspect path/to/trace.nsys-rep cpu_sample:1234
 veloq nsys ncu-command path/to/trace.nsys-rep kernel:1234
 veloq nsys ncu-command path/to/trace.nsys-rep kernel:1234 --print | bash
 
-# ── NCU (kernel reports) — namespaced under `ncu`
+# ── NCU (`.ncu-rep` / `.ncu-repz` kernel reports) — namespaced under `ncu`
 # Slim overview (launch-derived totals + NCU-version session)
 veloq ncu summary path/to/report.ncu-rep
 veloq ncu summary --format csv path/to/report.ncu-rep
@@ -329,14 +354,14 @@ Every successful JSON call returns the source-qualified v1 envelope:
 ```json
 {
   "schema": "v1",
-  "source": { "kind": "nsys", "version": "v3" },
+  "source": { "kind": "nsys", "version": "v4" },
   "command": "nsys.stats",
   "trace": { "kind": "nsys", "path": "trace.nsys-rep" },
   "trace_span": { "origin_ns": 0, "span_ns": 12345000000 },
   "data": {
     "count": 50,
     "total_matched": 1234,
-    "rows": [{ "key": "kernel|...|dev:0|stream:7", "...": "..." }]
+    "rows": [{ "key": "kernel|...|pid:12345|dev:0|stream:7", "...": "..." }]
   }
 }
 ```
@@ -347,12 +372,13 @@ Every successful JSON call returns the source-qualified v1 envelope:
   (`"nsys"`, `"ncu"`, `"pytorch"`, or `"veloq"` for meta verbs).
 - `source.version` — per-source wire-format version. Bumps
   independently from the envelope when the source's payload shapes
-  change. Currently NSys reports `v3` (`v1` introduced the NVTX domain
+  change. Currently NSys reports `v4` (`v1` introduced the NVTX domain
   dimension on `stats --group-by nvtx-path` rows; `v2` makes `prep` and
   `prep --status` canonical list responses where `data.rows[]` carries
   registered sidecar readiness keyed as `sidecar|<sidecar-id>`; `v3`
   removes the `viz timeline` label character-cap option and response
-  echo) and NCU reports `v1` (the
+  echo; `v4` makes CUDA-local identities, filters, keys, aggregations,
+  graph correlation, and trace-map device scopes process-aware) and NCU reports `v1` (the
   `ncu_report`-native wire — `inspect` carries no section catalog and
   `summary.auxiliary.session` keeps only the NCU version; each
   `ncu inspect` metric's
@@ -392,7 +418,7 @@ Errors share the same shape, with `data` replaced by `error`:
 ```json
 {
   "schema": "v1",
-  "source": { "kind": "nsys", "version": "v3" },
+  "source": { "kind": "nsys", "version": "v4" },
   "command": "nsys.stats",
   "trace": { "kind": "nsys", "path": "trace.nsys-rep" },
   "error": {
@@ -422,11 +448,11 @@ without a JSON envelope.
 | `inspect`           | Full per-kind details for one or more `row_id`s                                                                                                                                         |
 | `correlate`         | CPU↔GPU causal chain for a `row_id`                                                                                                                                                     |
 | `ncu-command`       | Generate a native `ncu` rerun command for one selected kernel event                                                                                                                     |
-| `gaps`              | GPU idle bubbles. Default `--scope device` is cross-stream (no phantom gaps from idle peer streams); `--scope stream` for per-stream starvation; `--scope trace` for multi-GPU rig idle |
+| `gaps`              | GPU idle bubbles. Default `--scope device` is per process/device and cross-stream; `--scope stream` for per-stream starvation; `--scope trace` for whole-trace idle                    |
 | `timeline`          | Time-bucketed GPU activity (busy ns + per-kind breakdown per bucket)                                                                                                                    |
 | `viz timeline`      | Export a bounded NSys timeline window as an SVG artifact with resolved track roles, placement provenance, render metadata, and label counters                                           |
-| `concurrency`       | Kernel/transfer overlap: per-device union vs sum busy time, peak concurrency, per-stream (incl. same-stream PDL) + compute/copy overlap. Extraction-only (ratios in jq)                 |
-| `graph-replays`     | CUDA Graph replay decomposition: per-replay GPU work keyed by `(device, context, correlationId)`, across both `--cuda-graph-trace=graph` and `=node` captures                           |
+| `concurrency`       | Kernel/transfer overlap: per-process/device union vs sum busy time, peak concurrency, per-stream (incl. same-stream PDL) + compute/copy overlap. Extraction-only (ratios in jq)         |
+| `graph-replays`     | CUDA Graph replay decomposition: per-replay GPU work keyed by `(process, device, context, correlationId)`, across both `--cuda-graph-trace=graph` and `=node` captures                  |
 | `slices`            | Per-NVTX-range CPU bounds + attributed GPU work                                                                                                                                         |
 | `hardware`          | CPU / GPU / NIC inventory from the trace's `TARGET_INFO_*` tables                                                                                                                       |
 | `metrics`           | GPU/NIC PM counters, CPU IP samples, or CPU scheduler events — hotspot summary, time series, callchain via `inspect`                                                                    |
@@ -436,6 +462,17 @@ without a JSON envelope.
 
 Every NSys command above can also be invoked as `veloq nsys <command>
 ...`; the top-level form is kept as the default-source shorthand.
+
+NSys CUDA device ordinals are process-local. If multiple rank processes
+each expose logical device 0, `--device 0` alone is ambiguous; use
+`--process <native-pid> --device 0` for an exact scope. When an ordinal
+matches only one process, the original `--device <ordinal>` form remains
+sufficient and VeloQ resolves the PID automatically. `veloq info`
+reports `trace_map.devices.physical` separately from
+`trace_map.devices.logical_scopes[]` so physical inventory is not confused
+with `(process_id, device_id)` query identity. `viz timeline` expresses the
+same exact scope inside each device-bearing track spec:
+`--track gpu:process=<native-pid>,device=0`.
 
 ### NCU verbs (namespaced under `ncu`)
 
@@ -469,8 +506,11 @@ errors for malformed, unsupported-kind, or out-of-range launch row ids.
 ### PyTorch verbs (namespaced under `pytorch`)
 
 PyTorch is an experimental `source.version = "v0"` source for Kineto
-Chrome trace files (`.pt.trace.json` / `.pt.trace.json.gz`). Directory
-inputs and cross-rank collective skew are planned, not shipped in v0.
+Chrome trace files. Explicit `veloq pytorch ...` commands accept any
+`.json` / `.json.gz` filename; automatic source detection remains limited
+to `.pt.trace.json` / `.pt.trace.json.gz` so VeloQ does not claim unrelated
+JSON files. Directory inputs and cross-rank collective skew are planned,
+not shipped in v0.
 When one trace file contains multiple rank values, rank-scoped commands
 (`search`, `stats`, `timeline`, `slices`, and `collectives`) require
 `--rank <n>` or `--all-ranks`. `inspect` and `correlate` operate on
@@ -514,7 +554,7 @@ source-specific `collectives` verb.
 | `recipes [<id>]` | List or show registered workflow recipes (run `veloq recipes` for the catalog, `veloq recipes <id>` for one).                                                                                                                                                                                                                     |
 | `sources`        | Registered sources and their wire-format versions                                                                                                                                                                                                                                                                                 |
 | `clean <trace>`  | Remove the `<trace>.veloq/` artifact root generated by VeloQ                                                                                                                                                                                                                                                                      |
-| `agent`          | Install, update, uninstall, and diagnose VeloQ Agent Skills integrations for supported agent runtimes (`doctor` / `install <agent> --from-checkout <path>` / `update <agent>` / `uninstall <agent>`)                                                                                                                                |
+| `agent`          | Install, update, uninstall, and diagnose VeloQ Agent Skills integrations for supported agent runtimes (`doctor` / `install <agent> [--from-checkout <path>]` / `update <agent> [--from-checkout <path>]` / `uninstall <agent>`; default install source: Git marketplace `lucifer1004/veloq`)                                              |
 | `self-update`    | Update the binary and bundled Agent Skills from the latest GitHub release (`--check` / `--no-skills` / `--no-binary` / `--skills-dir`)                                                                                                                                                                                            |
 
 Per-verb flag detail, response shape, sort keys, and examples live
@@ -568,7 +608,7 @@ veloq bank search \
 
 NSys's `NVTX_EVENTS` table records CPU-side range timestamps only;
 GPU work is reached by walking `correlationId` from `NVTX → runtime
-API → kernel/memcpy/memset` with `(device, context)` disambiguation
+API → kernel/memcpy/memset` with `(process, device, context)` disambiguation
 from `TARGET_INFO_CUDA_CONTEXT_INFO`. VeloQ does this walk in SQL for
 `stats --nvtx`/`search --nvtx`/`slices` and in a pre-built index
 (`<trace>.veloq/correlation.bin`) for `correlate`.
@@ -595,9 +635,10 @@ NVTX tree can be built.
 | NSys    | `.nsys-rep`                 | Primary path; exported via `nsys export -t parquetdir` on first use                                           |
 | NSys    | `<stem>_pqtdir/`            | Pre-exported parquetdir; opened directly                                                                      |
 | NSys    | `<trace>.veloq/parquetdir/` | Generated alias for the owning `.nsys-rep`; not a separate source                                             |
-| NCU     | `.ncu-rep`                  | Nsight Compute kernel report (ingested via NVIDIA's `ncu_report` API at prep time; no vendored proto schemas) |
-| PyTorch | `.pt.trace.json`            | PyTorch/Kineto Chrome trace JSON                                                                              |
-| PyTorch | `.pt.trace.json.gz`         | Gzipped PyTorch/Kineto Chrome trace JSON                                                                      |
+| NCU     | `.ncu-rep`, `.ncu-repz`     | Nsight Compute kernel report, plain or zstd-compressed (ingested via NVIDIA's `ncu_report` API at prep time)   |
+| PyTorch | `.pt.trace.json`            | PyTorch/Kineto Chrome trace JSON; eligible for automatic detection                                            |
+| PyTorch | `.pt.trace.json.gz`         | Gzipped PyTorch/Kineto Chrome trace JSON; eligible for automatic detection                                    |
+| PyTorch | `.json`, `.json.gz`         | Accepted when explicitly routed through `veloq pytorch`; not claimed by automatic source detection            |
 
 `veloq info <trace>` reports which source claims the file based on
 the same `detect()` heuristic the dispatcher uses, so an agent can
@@ -605,8 +646,10 @@ probe a path without having to maintain its own extension list.
 
 NCU ingestion runs NVIDIA's `ncu_report` Python API at **prep time only**;
 query-time is NCU-free and the generated `<report>.veloq/` sidecar is
-portable across Linux/macOS/Windows. VeloQ auto-discovers the Nsight
-Compute install (`extras/python`, or the macOS app bundle's
+portable across Linux/macOS/Windows. VeloQ first uses an `ncu_report`
+module already importable by the selected interpreter, including NVIDIA's
+official `ncu-report` PyPI package. It otherwise auto-discovers a full
+Nsight Compute install (`extras/python`, or the macOS app bundle's
 `Contents/MacOS/python`). For a non-standard location, set
 `VELOQ_NCU_REPORT_DIR` to the directory containing `ncu_report.py`, and/or
 `VELOQ_PYTHON` to the interpreter to run the helper with.

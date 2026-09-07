@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
 """veloq NCU export helper — ncu_report-native sidecar.
 
-Drives NVIDIA's official `ncu_report` Python API (shipped in the NCU
-install under `extras/python/`) to emit veloq's ncu_report-native NCU
-sidecar as JSON on stdout. Uses ONLY the public API — no vendored
-protos, no NVIDIA files redistributed.
+Drives NVIDIA's official `ncu_report` Python API (available from the
+`ncu-report` PyPI package or an NCU install's `extras/python/`) to emit
+veloq's ncu_report-native NCU sidecar as JSON on stdout. Uses ONLY the
+public API — no vendored protos, no NVIDIA files redistributed.
 
 Usage:
-    python3 ncu_export.py <report.ncu-rep>          # JSON sidecar -> stdout
-    python3 ncu_export.py <report.ncu-rep> --probe   # capability probe only
+    python3 ncu_export.py <report.ncu-rep[z]>          # JSON sidecar -> stdout
+    python3 ncu_export.py <report.ncu-rep[z]> --probe   # capability probe only
 
-The Rust ingest path is authoritative: it sets PYTHONPATH to the located
-`ncu_report` module directory before invoking this. We also self-locate
-as a fallback so the helper runs standalone for fixture regeneration; the
-fallback mirrors the Rust-side cross-platform discovery so the
-two paths cannot diverge.
+The Rust ingest path is authoritative: it leaves an installed PyPI package
+on the interpreter's normal import path and, when available, passes a
+discovered full-install module directory as an import fallback.
 
-Tested against Nsight Compute 2026.1.1 (ncu_report API). Other versions
-are expected to work: the helper resolves all version-specific enum
-semantics (metric type/subtype/rollup, stall reasons) from the *live*
-ncu_report enum by name rather than hard-coding integer codes,
+Tested against Nsight Compute 2026.1.1 and 2026.2.1 (`ncu_report` API).
+Other supported versions are expected to work: the helper resolves all
+version-specific enum semantics (metric type/subtype/rollup, stall
+reasons) from the *live* ncu_report enum by name rather than
+hard-coding integer codes,
 so an enum renumber cannot corrupt output. A
 structural API change (a renamed/relocated enum container) collapses the
 reverse maps to empty, which is reported as a `classification: "degraded"`
@@ -34,58 +33,48 @@ import sys
 from pathlib import Path
 
 
-# --- Locate + import ncu_report (cross-platform discovery) ---------
-# Mirrors the Rust ingest path's discovery (crates/.../native/cache.rs):
-# VELOQ_NCU_REPORT_DIR override, then per-platform NCU install roots. The
-# Linux pattern follows mit-han-lab/ncu-report-skill and Enigmatisms/tachyon.
-def _locate_ncu_report() -> str | None:
-    override = os.environ.get("VELOQ_NCU_REPORT_DIR")
-    if override and (Path(override) / "ncu_report.py").is_file():
-        return override
-    if sys.platform == "darwin":
-        roots = ["/Applications"]
-        globs = [
-            "NVIDIA Nsight Compute*.app/Contents/MacOS/python",
-            "NVIDIA Nsight Compute*/extras/python",
-        ]
-    elif sys.platform == "win32":
-        roots = [
-            os.environ.get("ProgramW6432", r"C:\Program Files"),
-            os.environ.get("ProgramFiles", r"C:\Program Files"),
-            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-        ]
-        globs = ["NVIDIA Corporation/Nsight Compute */extras/python"]
-    else:
-        roots = ["/usr/local", "/opt/nvidia", "/opt/cuda"]
-        globs = [
-            "cuda-*/nsight-compute-*/extras/python",
-            "nsight-compute-*/extras/python",
-            "nsight-compute/*/extras/python",
-            "nsight-compute/extras/python",
-        ]
-    for root in roots:
-        p = Path(root)
-        if not p.is_dir():
-            continue
-        for g in globs:
-            for sub in sorted(p.glob(g), reverse=True):  # newest-ish first
-                if (sub / "ncu_report.py").is_file():
-                    return str(sub)
-    return None
+_MIN_REPZ_READER_VERSION = (2025, 4)
+
+
+class UnsupportedCompressedReportReader(RuntimeError):
+    pass
+
+
+def _release_version(value: str) -> tuple[int, int] | None:
+    parts = value.split(".")
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+def _validate_report_reader(path: str, version: str) -> None:
+    if Path(path).suffix != ".ncu-repz":
+        return
+    parsed = _release_version(version)
+    if parsed is None or parsed < _MIN_REPZ_READER_VERSION:
+        raise UnsupportedCompressedReportReader(
+            f"`{path}` requires ncu_report 2025.4 or newer "
+            f"(found `{version}`)"
+        )
 
 
 try:
     import ncu_report  # noqa: F401
 except ImportError:
-    _found = _locate_ncu_report()
-    if _found:
-        sys.path.insert(0, _found)
+    _fallback = os.environ.get("VELOQ_NCU_REPORT_DIR")
+    if _fallback and (Path(_fallback) / "ncu_report.py").is_file():
+        sys.path.insert(0, _fallback)
     try:
         import ncu_report  # noqa: F401
     except ImportError:
         sys.stderr.write(
-            "error: ncu_report Python module not importable. Set PYTHONPATH to "
-            "<ncu-install>/extras/python, or install Nsight Compute.\n"
+            "error: ncu_report Python module not importable. Install the official "
+            "`ncu-report` package, set VELOQ_NCU_REPORT_DIR to "
+            "<ncu-install>/extras/python, or set VELOQ_PYTHON to a suitable "
+            "interpreter.\n"
         )
         sys.exit(3)
 
@@ -432,6 +421,8 @@ def _workload(action):
 
 def build_sidecar(path: str) -> dict:
     report = ncu_report.load_report(path)
+    report_version = report.get_version()
+    _validate_report_reader(path, report_version)
     launches, ranges, graphs = [], [], []
     for ri in range(report.num_ranges()):
         rng = report.range_by_idx(ri)
@@ -448,8 +439,8 @@ def build_sidecar(path: str) -> dict:
             # skipped — out of veloq's CUDA scope.
     out = {
         "schema": "ncu-native-v1",
-        "ncu_version": report.get_version(),
-        "session": {"versions": [{"provider": "Nsight Compute", "version": report.get_version()}]},
+        "ncu_version": report_version,
+        "session": {"versions": [{"provider": "Nsight Compute", "version": report_version}]},
         "launches": launches,
     }
     # Visible signal that enum-name resolution degraded to the suffix
@@ -468,7 +459,7 @@ def build_sidecar(path: str) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="veloq NCU ncu_report-native export helper")
-    ap.add_argument("report", nargs="?", help="path to a .ncu-rep file")
+    ap.add_argument("report", nargs="?", help="path to a .ncu-rep or .ncu-repz file")
     ap.add_argument("--probe", action="store_true", help="capability probe: print ncu_report version and exit 0")
     args = ap.parse_args()
 
@@ -479,7 +470,11 @@ def main() -> int:
         sys.stderr.write("error: <report> is required (or pass --probe)\n")
         return 2
 
-    sidecar = build_sidecar(args.report)
+    try:
+        sidecar = build_sidecar(args.report)
+    except UnsupportedCompressedReportReader as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 4
     # Deterministic: sorted keys so re-export is byte-identical.
     json.dump(sidecar, sys.stdout, indent=2, sort_keys=True)
     sys.stdout.write("\n")
