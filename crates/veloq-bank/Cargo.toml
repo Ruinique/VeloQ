@@ -1,0 +1,25 @@
+[package]
+name = "veloq-bank"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Static bank-conflict and layout swizzle reasoning for the VeloQ CLI."
+include = ["src/**/*.rs"]
+
+[dependencies]
+veloq-core.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+thiserror.workspace = true
+comfy-table.workspace = true
+csv.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+
+[lints]
+workspace = true

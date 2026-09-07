@@ -761,7 +761,13 @@ mod tests {
         let pqtdir = dir
             .path()
             .join(OsString::from_vec(vec![b'p', b'q', b't', 0xff]));
-        std::fs::create_dir_all(&pqtdir)?;
+        if let Err(e) = std::fs::create_dir_all(&pqtdir) {
+            if e.raw_os_error() == Some(92) {
+                // macOS APFS rejects non-UTF-8 path bytes at filesystem level.
+                return Ok(());
+            }
+            return Err(e.into());
+        }
         std::fs::write(
             pqtdir.join("CUPTI_ACTIVITY_KIND_KERNEL.parquet"),
             b"not a parquet file",

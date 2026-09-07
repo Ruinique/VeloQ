@@ -18,6 +18,9 @@ pub enum CliError {
 
     #[error(transparent)]
     Meta(#[from] MetaError),
+
+    #[error(transparent)]
+    Bank(#[from] veloq_bank::BankError),
 }
 
 impl CliError {
@@ -35,12 +38,14 @@ impl VeloqDiagnostic for CliError {
             }
             Self::SourceRun { .. } => ErrorCode::new("cli.source-run"),
             Self::Meta(err) => err.code(),
+            Self::Bank(err) => err.code(),
         }
     }
 
     fn hint(&self) -> Option<Cow<'_, str>> {
         match self {
             Self::Meta(err) => err.hint(),
+            Self::Bank(err) => err.hint(),
             _ => None,
         }
     }

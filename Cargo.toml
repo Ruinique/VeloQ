@@ -5,6 +5,7 @@ members = [
     "crates/veloq-data",
     "crates/veloq-query",
     "crates/veloq-vis",
+    "crates/veloq-bank",
     "crates/veloq",
     "crates/nsys/*",
     "crates/ncu/*",
@@ -34,6 +35,7 @@ veloq-core = { path = "crates/veloq-core", version = "0.4.1" }
 veloq-data = { path = "crates/veloq-data", version = "0.4.1" }
 veloq-query = { path = "crates/veloq-query", version = "0.4.1" }
 veloq-vis = { path = "crates/veloq-vis", version = "0.4.1" }
+veloq-bank = { path = "crates/veloq-bank", version = "0.4.1" }
 veloq-nsys = { path = "crates/nsys/veloq-nsys", version = "0.4.1" }
 veloq-nsys-data = { path = "crates/nsys/veloq-nsys-data", version = "0.4.1" }
 veloq-nsys-query = { path = "crates/nsys/veloq-nsys-query", version = "0.4.1" }

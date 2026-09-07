@@ -166,6 +166,22 @@ full` at capture time).
    and use native `ncu` recapture/export workflows; see
    [references/limitations.md](references/limitations.md).
 
+### Shared memory / LDS bank conflict & CuTe Swizzle workflow
+
+When encountering shared memory bank conflicts (`l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum`, `warp_serialize_stalls`), AMD LDS bank conflicts, or CuTe swizzle optimization:
+
+1. **Locate Hotspot with Profiler**: Identify the kernel launch using `veloq ncu summary` / `veloq ncu launches`.
+2. **Pinpoint Instruction & Source Line**: Use `veloq ncu disasm` and `veloq ncu source-metrics --counter '*bank_conflicts*' --by line|sass` to find the offending memory instructions.
+3. **Extract Lane Mapping from Source**: From the CUDA/HIP source or CuTe layout, extract the `lane -> logical coordinate` access mapping for a warp/wavefront transaction.
+4. **Construct Access Pattern**: Create `access.json` (or inline `--coords '0:0,0;1:1,0;...'`).
+5. **Trace Accesses with VeloQ Bank**: Run `veloq bank trace --shape <RxC> --stride <S0,S1> --dtype <type> --swizzle <B,M,S> --access access.json` to inspect physical offsets, byte addresses, banks, and conflict groups.
+6. **Compare & Search Swizzles**: Use `veloq bank compare` or `veloq bank search` to explore candidate `Swizzle<B,M,S>` parameters that minimize conflict degree.
+7. **Explain Bit-Level Reasoning**: Run `veloq bank explain` to understand target bits, source bits, and alignment to stride boundaries.
+8. **Apply Kernel Optimization**: Update the kernel code with the candidate swizzle layout.
+9. **Re-profile to Validate**: Re-run the hardware profiler to confirm that bank conflict counters and warp stall cycles decreased in hardware execution.
+
+> **Guideline:** Never modify kernel code based solely on `bank search` rankings. The static model and hardware profile evidence must always validate each other.
+
 Detailed kernel-analysis workflow notes:
 [references/workflow.md](references/workflow.md)
 

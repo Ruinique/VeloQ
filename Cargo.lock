@@ -3405,10 +3405,26 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "veloq-bank",
  "veloq-core",
  "veloq-ncu",
  "veloq-nsys",
  "veloq-pytorch",
+]
+
+[[package]]
+name = "veloq-bank"
+version = "0.4.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "comfy-table",
+ "csv",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "veloq-core",
 ]
 
 [[package]]

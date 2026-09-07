@@ -231,6 +231,9 @@ fn build_parser(sources: &[Box<dyn ProfileSource>]) -> Command {
         root = root.subcommand(meta_cmd);
     }
 
+    // Static bank reasoning verb (`veloq bank ...`).
+    root = root.subcommand(veloq_bank::cli());
+
     root
 }
 
@@ -244,6 +247,11 @@ fn dispatch(
     fmt: OutputFormat,
 ) -> CliResult<i32> {
     let (sub_name, sub_matches) = matches.subcommand().ok_or(CliError::NoSubcommand)?;
+
+    // Static bank reasoning verb (`veloq bank ...`).
+    if sub_name == "bank" {
+        return veloq_bank::run(sub_matches, fmt).map_err(CliError::from);
+    }
 
     // Meta verbs come first — they're owned by the binary, not by
     // any profile source. Success responses are JSON-only; `--format`

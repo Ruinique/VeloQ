@@ -1,0 +1,8 @@
+{
+  "accesses": [
+    {"lane": 0, "coord": [0, 0]},
+    {"lane": 1, "coord": [1, 0]},
+    {"lane": 2, "coord": [2, 0]},
+    {"lane": 3, "coord": [3, 0]}
+  ]
+}

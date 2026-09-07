@@ -27,6 +27,8 @@ covers the Perfetto-style Chrome trace shape used by PyTorch profiler.
 - 10 experimental PyTorch verbs: `summary`, `search`, `inspect`,
   `stats`, `correlate`, `timeline`, `slices`, `collectives`, `prep`,
   and `schema`.
+- Four static bank reasoning verbs: `bank explain`, `bank trace`,
+  `bank compare`, and `bank search`.
 - Six root meta verbs: `info`, `sources`, `clean`, `recipes`, `agent`,
   and `self-update`.
 
@@ -495,6 +497,15 @@ source-specific `collectives` verb.
 | `pytorch prep`            | json / csv / table | Build or inspect PyTorch sidecars under `<input>.veloq/pytorch/`                                               |
 | `pytorch schema <target>` | json               | Strict JSON Schema for one PyTorch response; schema targets are the response field inventory                   |
 
+### Bank verbs (namespaced under `bank`)
+
+| Command         | Projections        | Purpose                                                                                |
+| --------------- | ------------------ | -------------------------------------------------------------------------------------- |
+| `bank explain`  | json / table / csv | Bit-level analysis of a CuTe-style `Swizzle<B,M,S>` (target bits, source bits, mask op)|
+| `bank trace`    | json / table / csv | Trace lane access pattern to physical offsets, byte addresses, banks, and conflicts    |
+| `bank compare`  | json / table / csv | Evaluate and rank multiple candidate swizzles for an access pattern                    |
+| `bank search`   | json / table / csv | Search parameter space for zero-conflict swizzles with bit-alignment reasoning        |
+
 ### Meta verbs (root, owned by the binary)
 
 | Command          | Purpose                                                                                                                                                                                                                                                                                                                           |
@@ -509,6 +520,49 @@ source-specific `collectives` verb.
 Per-verb flag detail, response shape, sort keys, and examples live
 in `veloq <verb> --help` (which is projected from the same
 `JsonSchema` derive as the response, so it can't drift).
+
+## Static bank-conflict reasoning
+
+Profiler evidence tells you that a conflict exists.
+`veloq bank` explains the address mapping that causes it.
+
+Given lane access pattern, layout, data type, bank model, and CuTe-style swizzle, `veloq bank` computes:
+`lane -> logical coordinate -> physical offset -> byte address -> bank -> conflict group`.
+
+```bash
+# Explain bit manipulation of a Swizzle
+veloq bank explain --swizzle 2,4,2 --stride 64 --dtype f16
+
+# Trace lane addresses and bank conflict
+veloq bank trace \
+  --shape 8x64 \
+  --stride 64,1 \
+  --dtype f16 \
+  --swizzle 2,4,2 \
+  --arch amd \
+  --access tests/data/bank/row_alias.json
+
+# Compare candidate swizzles
+veloq bank compare \
+  --shape 8x64 \
+  --stride 64,1 \
+  --dtype f16 \
+  --arch amd \
+  --access tests/data/bank/row_alias.json \
+  --swizzle 3,3,3 \
+  --swizzle 2,4,2
+
+# Search parameter space for zero-conflict swizzles
+veloq bank search \
+  --shape 8x64 \
+  --stride 64,1 \
+  --dtype f16 \
+  --arch amd \
+  --access tests/data/bank/row_alias.json \
+  --b 1:4 --m 2:5 --s 1:5 --limit 10
+```
+
+> **v0 limitation:** v0 models the supplied transaction groups exactly as given. It does not yet infer hardware-specific phase grouping for `ldmatrix`, `ds_read_b128`, etc.
 
 ## NVTX caveat
 
